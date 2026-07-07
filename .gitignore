@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Event camera recordings and generated output
+*.raw
+*.raw.tmp_index
+*.hdf5
+*.mp4
+recording_*.png
+snapshot_*.png
+suite_output*/
+plots*/
+rate_plots*/
