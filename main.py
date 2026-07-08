@@ -18,13 +18,14 @@ import sys
 # ── OpenEB environment bootstrap ──────────────────────────────────────────────
 _INSTALL    = os.environ.get("OPENEB_INSTALL_DIR", os.path.expanduser("~/openeb/install"))
 _LIBDIR     = os.path.join(_INSTALL, "lib")
-_PYDIR      = os.path.join(_INSTALL, "lib", "python3.12", "dist-packages")
+_PYVER      = f"python{sys.version_info.major}.{sys.version_info.minor}"
+_PYDIR      = os.path.join(_INSTALL, "lib", _PYVER, "dist-packages")
 _HAL_PLUGINS  = os.path.join(_INSTALL, "lib", "metavision", "hal", "plugins")
 _HDF5_PLUGINS = os.path.join(_INSTALL, "lib", "hdf5", "plugin")
 
 _cv2_qt_fonts = os.path.join(
     os.path.dirname(os.path.dirname(sys.executable)),
-    "lib", "python3.12", "site-packages", "cv2", "qt", "fonts",
+    "lib", _PYVER, "site-packages", "cv2", "qt", "fonts",
 )
 try:
     os.makedirs(_cv2_qt_fonts, exist_ok=True)
@@ -40,6 +41,17 @@ for _envvar, _path in [
     _curr = os.environ.get(_envvar, "")
     if _path not in _curr:
         os.environ[_envvar] = f"{_path}:{_curr}" if _curr else _path
+        _need_reexec = True
+
+# Required for the GenX320 (and IMX636) v4l2 plugin on Raspberry Pi: parse MIPI
+# frame-end markers and use dma-heap allocation instead of mmap. Harmless no-ops
+# on non-v4l2 (e.g. USB) setups.
+for _envvar, _val in [
+    ("PSEE_VAR_V4L2_BSIZE", "1"),
+    ("V4L2_HEAP",           "vidbuf_cached"),
+]:
+    if _envvar not in os.environ:
+        os.environ[_envvar] = _val
         _need_reexec = True
 
 if _PYDIR not in sys.path:

@@ -15,7 +15,8 @@ import sys
 # ── OpenEB environment bootstrap ──────────────────────────────────────────────
 _INSTALL    = os.environ.get("OPENEB_INSTALL_DIR", os.path.expanduser("~/openeb/install"))
 _LIBDIR     = os.path.join(_INSTALL, "lib")
-_PYDIR      = os.path.join(_INSTALL, "lib", "python3.12", "dist-packages")
+_PYVER      = f"python{sys.version_info.major}.{sys.version_info.minor}"
+_PYDIR      = os.path.join(_INSTALL, "lib", _PYVER, "dist-packages")
 _HAL_PLUGINS  = os.path.join(_INSTALL, "lib", "metavision", "hal", "plugins")
 _HDF5_PLUGINS = os.path.join(_INSTALL, "lib", "hdf5", "plugin")
 

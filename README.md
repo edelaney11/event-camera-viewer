@@ -21,7 +21,7 @@ Developed and tested against a Prophesee EVK4HD (IMX636 sensor). `camera_manager
 
 - A Prophesee/Metavision-compatible event camera (for live capture — file playback works without one)
 - [OpenEB](https://github.com/prophesee-ai/openeb) built from source (there's no pip package for `metavision_hal`/`metavision_core`)
-- Python 3.12 (to match OpenEB's bundled `dist-packages` layout — adjust the paths in `main.py`/`export_mp4.py` if you built against a different version)
+- Python — `main.py`/`export_mp4.py` auto-detect their own interpreter's version (`python{major}.{minor}`) to locate OpenEB's `dist-packages`, so this works regardless of which Python version OpenEB was built against, as long as it's the same one running the viewer
 - `python3-tk` for the bias/filter control panels:
   ```bash
   sudo apt install python3-tk
@@ -50,6 +50,21 @@ Developed and tested against a Prophesee EVK4HD (IMX636 sensor). `camera_manager
    ```
 
 `main.py` and `export_mp4.py` bootstrap the OpenEB environment (`LD_LIBRARY_PATH`, `MV_HAL_PLUGIN_PATH`, `HDF5_PLUGIN_PATH`) automatically and re-exec themselves if it isn't already sourced — you don't need to source anything by hand first.
+
+### Raspberry Pi (GenX320 Starter Kit)
+
+The [Prophesee GenX320 Starter Kit for Raspberry Pi 5](https://www.prophesee.ai/event-based-starter-kit-genx320-raspberry-pi-5/) connects the sensor over the **CSI ribbon cable**, not USB, and talks to it through a **V4L2 HAL plugin** rather than the standard USB path. This needs a different OpenEB build than the generic instructions above:
+
+1. Build OpenEB with the RPi patch from [`prophesee-ai/rpi-sensor-drivers`](https://github.com/prophesee-ai/rpi-sensor-drivers) applied (its README covers cloning OpenEB, applying `openeb-for-rpi.patch`, and building) — this is a **separate build** from a plain/unpatched OpenEB checkout, since the plain build has no V4L2/CSI support at all.
+2. Point `OPENEB_INSTALL_DIR` at wherever *that* patched build actually installed to (check the `-DCMAKE_INSTALL_PREFIX` you used, or wherever `sudo make install` reported — a bare `sudo make install` with no custom prefix typically lands in `/usr/local`, not under your home directory).
+3. Every boot, before running the viewer, load the sensor's kernel driver and set up its V4L2 pipeline:
+   ```bash
+   sudo dtoverlay genx320,cam0     # or ,cam1, depending on which CSI port
+   ~/rpi-sensor-drivers/rp5_setup_v4l.sh
+   ```
+   These are kernel/shell-level steps that `main.py` has no way to do itself. `main.py` does automatically set the two runtime environment variables the V4L2 plugin needs (`PSEE_VAR_V4L2_BSIZE=1`, `V4L2_HEAP=vidbuf_cached`), so nothing else needs to be sourced.
+
+If `python main.py` reports `ModuleNotFoundError: No module named 'metavision_hal'`, double check `OPENEB_INSTALL_DIR` is pointing at the RPi-patched build and not a plain one — it's easy to end up with both on disk (e.g. `~/openeb` and `~/openeb-rpi`) and have the wrong one picked up by default.
 
 ## Quickstart
 
