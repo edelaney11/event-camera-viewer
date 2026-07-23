@@ -5,6 +5,7 @@ Controls
 Mouse drag   Draw and apply hardware ROI
 R            Toggle RAW recording
 H            Toggle HDF5 recording
+M            Rename the last completed recording
 B            Toggle bias control panel
 C            Clear ROI (full sensor)
 +  /  -      Increase / decrease accumulation time (5 ms steps)
@@ -20,6 +21,7 @@ Q / Esc      Quit
 from __future__ import annotations
 
 import itertools
+import os
 import sys
 import threading
 import time
@@ -29,6 +31,7 @@ from typing import Optional
 
 import cv2
 import tkinter as tk
+from tkinter import simpledialog
 import ttkbootstrap as ttk
 import pyvirtualcam
 
@@ -160,6 +163,29 @@ def _pill(img: np.ndarray, text: str, x: int, y: int, color,
     return w
 
 
+def _wrap_tokens(tokens: list[str], max_width: int, font_scale: float,
+                  thickness: int = 1, sep: str = "  ", first_line_width: int | None = None) -> list[str]:
+    """Greedily pack tokens onto as few lines as fit within max_width each —
+    used so HUD text degrades to multiple lines on small sensors (e.g. the
+    GenX320's 320x320) instead of silently running off the edge of the frame.
+    Tokens are treated as atomic (never split mid-token); pass first_line_width
+    to make the first line narrower than the rest (e.g. to leave room for badges)."""
+    lines: list[str] = []
+    current = ""
+    for tok in tokens:
+        limit = first_line_width if (first_line_width is not None and not lines) else max_width
+        candidate = f"{current}{sep}{tok}" if current else tok
+        (w, _), _ = cv2.getTextSize(candidate, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        if w > limit and current:
+            lines.append(current)
+            current = tok
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
+
+
 class EventVisualizer:
     def __init__(
         self,
@@ -197,6 +223,12 @@ class EventVisualizer:
         self._hdf5_lock = threading.Lock()
         self._hdf5_writer: Optional[HDF5Writer] = None
         self._hdf5_pending: list[np.ndarray] = []
+
+        # ── Recording rename (path of the in-progress / most recently
+        # completed recording, so it can be renamed after the fact) ──────────
+        self._current_raw_path: Optional[str] = None
+        self._last_recording_path: Optional[str] = None
+        self._last_recording_kind: Optional[str] = None
 
         # ── ROI drag state ───────────────────────────────────────────────────
         self._roi_drawing = False
@@ -323,6 +355,67 @@ class EventVisualizer:
             for batch in pending:
                 writer.write(batch)
             writer.close()
+            self._last_recording_path = writer.path
+            self._last_recording_kind = "HDF5"
+
+    # ── RAW recording helpers (called from main thread) ───────────────────────
+
+    def _stop_raw_recording(self) -> None:
+        if not self._cam.is_raw_recording:
+            return
+        self._cam.stop_raw_recording()
+        if self._current_raw_path is not None:
+            self._last_recording_path = self._current_raw_path
+            self._last_recording_kind = "RAW"
+            self._current_raw_path = None
+
+    # ── Rename a completed recording (tkinter dialog) ──────────────────────────
+
+    def _rename_last_recording(self) -> None:
+        if self._last_recording_path is None:
+            print("[INFO] No completed recording to rename yet.", file=sys.stderr)
+            return
+        old_path = self._last_recording_path
+        if not os.path.exists(old_path):
+            print(f"[WARN] Recording file no longer exists: {old_path}", file=sys.stderr)
+            return
+
+        self._ensure_tk_master()
+        directory, filename = os.path.split(old_path)
+        stem, ext = os.path.splitext(filename)
+        new_stem = simpledialog.askstring(
+            "Rename Recording",
+            f"New name for {self._last_recording_kind} recording:",
+            initialvalue=stem,
+            parent=self._tk_master,
+        )
+        if new_stem is None:
+            return
+        new_stem = os.path.basename(new_stem.strip())  # guard against path traversal
+        if not new_stem or new_stem == stem:
+            return
+
+        new_path = os.path.join(directory, new_stem + ext)
+        if os.path.exists(new_path):
+            print(f"[WARN] A file already exists at {new_path} — rename cancelled.", file=sys.stderr)
+            return
+
+        try:
+            os.rename(old_path, new_path)
+        except OSError as exc:
+            print(f"[WARN] Rename failed: {exc}", file=sys.stderr)
+            return
+
+        # RAW recordings may have a companion seek-index cache — carry it along.
+        old_index = old_path + ".tmp_index"
+        if os.path.exists(old_index):
+            try:
+                os.rename(old_index, new_path + ".tmp_index")
+            except OSError:
+                pass
+
+        self._last_recording_path = new_path
+        print(f"Renamed recording: {filename} -> {os.path.basename(new_path)}")
 
     # ── Bias panel (tkinter) ──────────────────────────────────────────────────
 
@@ -584,10 +677,6 @@ class EventVisualizer:
             roi_str = (f"ROI: {self._active_roi[0]},{self._active_roi[1]}"
                        f"-{self._active_roi[2]},{self._active_roi[3]}")
 
-        _alpha_panel(out, 0, 0, W, 27)
-        cv2.putText(out, f"{ts_str}   {rate_str}   {accum_str}   {roi_str}", (10, 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, _HUD_TEXT, 1, cv2.LINE_AA)
-
         # Blinking recording badges (pulses between full and dimmed colour)
         rec_pulse = (int(ts_us / 500_000) % 2 == 0)
         rec_color = _HUD_REC if rec_pulse else tuple(c // 2 for c in _HUD_REC)
@@ -603,30 +692,69 @@ class EventVisualizer:
             speed_label = "MAX" if self._replay_speed == 0 else f"x{self._replay_speed:g}"
             badges.append((speed_label, _HUD_ACCENT))
 
-        bx, gap = W - 8, 6
+        gap = 6
+        badges_w = sum(_pill_size(t)[0] + gap for t, _ in badges) if badges else 0
+
+        # Wrap the status text onto as many lines as the frame needs (small
+        # sensors like the GenX320's 320x320 can't fit it on one line) — the
+        # first line leaves room for the badges, further lines use the full width.
+        status_font = 0.48
+        line1_w = max(W - 20 - badges_w, 60)
+        lines = _wrap_tokens([ts_str, rate_str, accum_str, roi_str], W - 20, status_font,
+                             first_line_width=line1_w)
+
+        line_pitch = 17
+        panel_h = 10 + line_pitch * len(lines)
+        _alpha_panel(out, 0, 0, W, panel_h)
+        for i, line in enumerate(lines):
+            cv2.putText(out, line, (10, 18 + i * line_pitch),
+                        cv2.FONT_HERSHEY_SIMPLEX, status_font, _HUD_TEXT, 1, cv2.LINE_AA)
+
+        bx = W - 8
         for text, color in reversed(badges):
             w, _ = _pill_size(text)
             bx -= w
             _pill(out, text, bx, 3, color)
             bx -= gap
 
+        # Bottom hint bar text is computed here (but drawn last) so the suite/
+        # playlist bars above it can be positioned against its real height —
+        # it can wrap to more than one line on narrow frames like the GenX320's.
+        if self._playlist is not None:
+            hint = "[/:prev  ]:next  ,/.:speed  +/-:accum  Spc:pause  S:snap  Q:quit"
+        elif self._file_mode:
+            hint = ",/.:speed  +/-:accum  Spc:pause  S:snap  K:track  Q:quit"
+        else:
+            hint = "drag:ROI  O:centreROI  C:clrROI  R:RAW  H:HDF5  M:rename  B:biases  F:filters  K:track  T:suite  +/-:accum  Spc:pause  Q:quit"
+
+        hint_font = 0.38
+        hint_lines = _wrap_tokens(hint.split("  "), W - 12, hint_font)
+        hint_pitch = 14
+        hint_h = 8 + hint_pitch * len(hint_lines)
+        bottom_bar_y0 = H - hint_h - 20
+
         # Suite status bar (above the hint, when active)
         if self._suite is not None and (self._suite.is_active or self._suite.is_done):
-            suite_y0 = H - 40
+            suite_y0 = bottom_bar_y0
             _alpha_panel(out, 0, suite_y0, W, suite_y0 + 20)
             self._draw_suite_bar(out, suite_y0, W)
 
         # Playlist bar (above the hint, always shown in playlist mode)
         if self._playlist is not None:
-            pl_y0 = H - 40
+            pl_y0 = bottom_bar_y0
             _alpha_panel(out, 0, pl_y0, W, pl_y0 + 20)
             idx_str = f"[{self._playlist.current_index + 1}/{self._playlist.total}]"
             label = f"{idx_str}  {self._playlist.current_name}"
             cv2.putText(out, label, (10, pl_y0 + 14),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, _HUD_FILTER, 1, cv2.LINE_AA)
-            nav = "[ prev   ] next"
-            cv2.putText(out, nav, (W - 110, pl_y0 + 14),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, _HUD_TEXT_DIM, 1, cv2.LINE_AA)
+            # "[ prev ] next" is just a hint and already duplicated in the bottom
+            # hint bar below — skip it on narrow frames rather than let it
+            # collide with a long filename (which is the more useful of the two).
+            (label_w, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            nav_x = W - 110
+            if 10 + label_w + 10 <= nav_x:
+                cv2.putText(out, "[ prev   ] next", (nav_x, pl_y0 + 14),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.40, _HUD_TEXT_DIM, 1, cv2.LINE_AA)
 
         # Object tracker — bounding box, trail, and selection preview
         if self._tracker is not None and self._tracker.bbox is not None:
@@ -649,16 +777,13 @@ class EventVisualizer:
             mx, my = (W - mw) // 2, H // 2 - mh // 2
             _pill(out, msg, mx, my, _HUD_FILTER, font_scale=0.48, pad_x=14, pad_y=8)
 
-        # Bottom hint bar
-        if self._playlist is not None:
-            hint = "[/:prev  ]:next  ,/.:speed  +/-:accum  Spc:pause  S:snap  Q:quit"
-        elif self._file_mode:
-            hint = ",/.:speed  +/-:accum  Spc:pause  S:snap  K:track  Q:quit"
-        else:
-            hint = "drag:ROI  O:centreROI  C:clrROI  R:RAW  H:HDF5  B:biases  F:filters  K:track  T:suite  +/-:accum  Spc:pause  Q:quit"
-        _alpha_panel(out, 0, H - 22, W, H)
-        cv2.putText(out, hint, (6, H - 7),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, _HUD_TEXT_DIM, 1, cv2.LINE_AA)
+        # Bottom hint bar (text/height computed above so the bars in front of it
+        # could be positioned correctly)
+        _alpha_panel(out, 0, H - hint_h, W, H)
+        for i, line in enumerate(hint_lines):
+            y = H - hint_h + 11 + i * hint_pitch
+            cv2.putText(out, line, (6, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, hint_font, _HUD_TEXT_DIM, 1, cv2.LINE_AA)
 
         return out
 
@@ -794,7 +919,7 @@ class EventVisualizer:
         finally:
             self._running = False
             self._stop_hdf5()
-            self._cam.stop_raw_recording()
+            self._stop_raw_recording()
             cv2.destroyAllWindows()
             if self._vcam is not None:
                 self._vcam.close()
@@ -872,10 +997,11 @@ class EventVisualizer:
             if self._file_mode:
                 print("[INFO] RAW recording not available in file playback mode.")
             elif self._cam.is_raw_recording:
-                self._cam.stop_raw_recording()
+                self._stop_raw_recording()
             else:
                 path = f"recording_{datetime.now():%Y%m%d_%H%M%S}.raw"
-                self._cam.start_raw_recording(path)
+                if self._cam.start_raw_recording(path):
+                    self._current_raw_path = path
 
         elif key in (ord("h"), ord("H")):
             if self._file_mode:
@@ -887,6 +1013,12 @@ class EventVisualizer:
                     self._stop_hdf5()
                 else:
                     self._start_hdf5()
+
+        elif key in (ord("m"), ord("M")):
+            if self._file_mode:
+                print("[INFO] Recording not available in file playback mode.")
+            else:
+                self._rename_last_recording()
 
         elif key in (ord("b"), ord("B")):
             if self._tk_root is not None:
