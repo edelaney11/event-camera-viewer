@@ -1,0 +1,14 @@
+[Unit]
+Description=GenX320 CSI sensor driver + V4L2 pipeline setup
+Before=genx320-record.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Adjust cam0/cam1 to match which CSI port the sensor is on, and the path
+# below to wherever rpi-sensor-drivers was cloned.
+ExecStart=/usr/bin/dtoverlay genx320,cam0
+ExecStart=/home/pi/rpi-sensor-drivers/rp5_setup_v4l.sh
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,18 @@
+[Unit]
+Description=GenX320 headless event recording
+After=genx320-setup.service network.target
+Requires=genx320-setup.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/repos/event-camera-viewer
+# Adjust the interpreter path if not using a venv at .venv, and --output-dir
+# to wherever recordings should land.
+ExecStart=/home/pi/repos/event-camera-viewer/.venv/bin/python record_headless.py --output-dir /home/pi/recordings
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

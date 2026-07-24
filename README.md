@@ -66,6 +66,29 @@ The [Prophesee GenX320 Starter Kit for Raspberry Pi 5](https://www.prophesee.ai/
 
 If `python main.py` reports `ModuleNotFoundError: No module named 'metavision_hal'`, double check `OPENEB_INSTALL_DIR` is pointing at the RPi-patched build and not a plain one — it's easy to end up with both on disk (e.g. `~/openeb` and `~/openeb-rpi`) and have the wrong one picked up by default.
 
+### Headless recording (Raspberry Pi)
+
+`main.py` needs a real display and keyboard — it opens an OpenCV window and Tk bias panels, and recording is toggled with the `R`/`H` keys. That's the wrong shape for a Pi with no monitor attached. For that case, use `record_headless.py` instead: it opens the camera and starts RAW recording immediately with no GUI at all, then blocks until it receives SIGINT/SIGTERM.
+
+```bash
+python record_headless.py --output-dir ~/recordings [--serial <SN>] [--bias-file biases.json]
+```
+
+`--bias-file` is optional — a flat JSON file of `{"bias_name": value, ...}` applied before recording starts, since there's no bias panel to use headlessly.
+
+To control it remotely over SSH, wrap it in the systemd units under [`systemd/`](systemd/):
+
+1. Copy both unit files to `/etc/systemd/system/`, adjusting the placeholder paths inside each (CSI port `cam0`/`cam1`, `rpi-sensor-drivers` location, repo/venv path, `--output-dir`) to match your install.
+2. `sudo systemctl daemon-reload && sudo systemctl enable --now genx320-setup` — this runs the `dtoverlay`/`rp5_setup_v4l.sh` steps from the previous section automatically on every boot, so the sensor is ready before you ever SSH in.
+3. Start/stop a recording from any machine on the network:
+   ```bash
+   ssh pi@<host> sudo systemctl start genx320-record   # begin recording
+   ssh pi@<host> sudo systemctl stop genx320-record     # stop and finalize the file
+   ssh pi@<host> systemctl status genx320-record        # is it currently recording?
+   ssh pi@<host> journalctl -u genx320-record -f        # follow its log live
+   ```
+`genx320-record` is intentionally left disabled (not started on boot) so recording is something you trigger on demand — enable it too (`systemctl enable`) only if you actually want it to start recording automatically at power-on.
+
 ## Quickstart
 
 Live view from the first camera found:
@@ -218,6 +241,8 @@ All subcommands accept `--label-a`/`--label-b` to name the runs being compared; 
 ```
 event-camera-viewer/
 ├── main.py              Live viewer / playback CLI entry point
+├── record_headless.py   No-GUI RAW recording for headless/remote deployments
+├── systemd/             Unit files for record_headless.py on a headless Raspberry Pi
 ├── camera_manager.py    HAL device wrapper (biases, ROI, RAW recording)
 ├── visualizer.py        OpenCV display, controls, recording
 ├── hdf5_reader.py       Custom HDF5 event format reader
