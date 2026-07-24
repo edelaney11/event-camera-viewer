@@ -85,6 +85,8 @@ python main.py --input recording_20260101_120000.raw --speed 2.0   # 2x speed
 python main.py --input recording_20260101_120000.raw --speed 0     # as fast as possible
 ```
 
+Playing back a single `.raw` file also adds a seek bar near the bottom of the HUD — click or drag it to scrub to any point in the file. (RAW files only, since seeking relies on the SDK's `RawReader`; not available for HDF5 or `--playlist` playback.) On first use it reads the file's full duration, which the SDK caches to a `<name>_info.json` sidecar so later runs (including `X` to split) skip the re-scan.
+
 Play a folder of recordings as a playlist (use `[` / `]` to move between files):
 ```bash
 python main.py --playlist ./my_recordings/
@@ -109,6 +111,10 @@ The virtual camera receives the clean rendered view *before* the on-screen HUD (
 | `Q` / `Esc` | Quit |
 | `R` | Start/stop RAW recording (live mode only) |
 | `H` | Start/stop HDF5 recording (live mode only) |
+| `M` | Rename the last completed recording |
+| `P` | Mark a split point at the current playback position (file mode only) |
+| `Backspace` | Undo the most recent split mark |
+| `X` | Split a RAW recording into multiple files — uses marked points if any, otherwise prompts for part lengths |
 | `B` | Open/close the bias control panel |
 | `F` | Open/close the noise/rate filter panel |
 | Mouse drag | Draw a custom hardware ROI |

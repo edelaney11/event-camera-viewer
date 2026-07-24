@@ -7,62 +7,21 @@ Live camera:
 File playback:
     python main.py --input recording_20240101_120000.hdf5 [--speed 1.0]
 
-If the OpenEB environment has not been sourced, the script will re-exec itself
-with the correct LD_LIBRARY_PATH and PYTHONPATH automatically.
+Locates a Prophesee event-camera SDK automatically — an OpenEB install is
+preferred, with the official Prophesee SDK installer as a fallback. See
+sdk_bootstrap.py.
 """
 from __future__ import annotations
 
-import os
 import sys
 
-# ── OpenEB environment bootstrap ──────────────────────────────────────────────
-_INSTALL    = os.environ.get("OPENEB_INSTALL_DIR", os.path.expanduser("~/openeb/install"))
-_LIBDIR     = os.path.join(_INSTALL, "lib")
-_PYVER      = f"python{sys.version_info.major}.{sys.version_info.minor}"
-_PYDIR      = os.path.join(_INSTALL, "lib", _PYVER, "dist-packages")
-_HAL_PLUGINS  = os.path.join(_INSTALL, "lib", "metavision", "hal", "plugins")
-_HDF5_PLUGINS = os.path.join(_INSTALL, "lib", "hdf5", "plugin")
-
-_cv2_qt_fonts = os.path.join(
-    os.path.dirname(os.path.dirname(sys.executable)),
-    "lib", _PYVER, "site-packages", "cv2", "qt", "fonts",
-)
-try:
-    os.makedirs(_cv2_qt_fonts, exist_ok=True)
-except OSError:
-    pass  # best-effort only (e.g. cv2 not installed under a writable venv path)
-
-_need_reexec = False
-for _envvar, _path in [
-    ("LD_LIBRARY_PATH",    _LIBDIR),
-    ("MV_HAL_PLUGIN_PATH", _HAL_PLUGINS),
-    ("HDF5_PLUGIN_PATH",   _HDF5_PLUGINS),
-]:
-    _curr = os.environ.get(_envvar, "")
-    if _path not in _curr:
-        os.environ[_envvar] = f"{_path}:{_curr}" if _curr else _path
-        _need_reexec = True
-
-# Required for the GenX320 (and IMX636) v4l2 plugin on Raspberry Pi: parse MIPI
-# frame-end markers and use dma-heap allocation instead of mmap. Harmless no-ops
-# on non-v4l2 (e.g. USB) setups.
-for _envvar, _val in [
-    ("PSEE_VAR_V4L2_BSIZE", "1"),
-    ("V4L2_HEAP",           "vidbuf_cached"),
-]:
-    if _envvar not in os.environ:
-        os.environ[_envvar] = _val
-        _need_reexec = True
-
-if _PYDIR not in sys.path:
-    sys.path.insert(0, _PYDIR)
-
-if _need_reexec:
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+from sdk_bootstrap import activate
+activate()
 
 # ── Normal imports ────────────────────────────────────────────────────────────
 
 import argparse
+import os
 import faulthandler
 faulthandler.enable()
 
@@ -208,7 +167,10 @@ def main() -> int:
         try:
             if args.input.lower().endswith(".raw"):
                 from raw_reader import RawEventsIterator
-                it = RawEventsIterator(args.input, delta_t_us=args.slice_us, replay_speed=args.speed)
+                it = RawEventsIterator(
+                    args.input, delta_t_us=args.slice_us, replay_speed=args.speed,
+                    keep_alive_at_eof=True,  # so the seek bar can scrub back after EOF
+                )
             else:
                 from hdf5_reader import HDF5EventsIterator
                 it = HDF5EventsIterator(args.input, delta_t_us=args.slice_us, replay_speed=args.speed)
@@ -224,6 +186,7 @@ def main() -> int:
             display_fps=args.fps,
             iterator=it,
             file_mode=True,
+            source_path=args.input,
             tracker_algo=args.tracker_algo,
             virtual_cam=args.virtual_cam,
         )

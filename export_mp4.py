@@ -9,37 +9,15 @@ Usage:
 """
 from __future__ import annotations
 
-import os
 import sys
 
-# ── OpenEB environment bootstrap ──────────────────────────────────────────────
-_INSTALL    = os.environ.get("OPENEB_INSTALL_DIR", os.path.expanduser("~/openeb/install"))
-_LIBDIR     = os.path.join(_INSTALL, "lib")
-_PYVER      = f"python{sys.version_info.major}.{sys.version_info.minor}"
-_PYDIR      = os.path.join(_INSTALL, "lib", _PYVER, "dist-packages")
-_HAL_PLUGINS  = os.path.join(_INSTALL, "lib", "metavision", "hal", "plugins")
-_HDF5_PLUGINS = os.path.join(_INSTALL, "lib", "hdf5", "plugin")
-
-_need_reexec = False
-for _envvar, _path in [
-    ("LD_LIBRARY_PATH",    _LIBDIR),
-    ("MV_HAL_PLUGIN_PATH", _HAL_PLUGINS),
-    ("HDF5_PLUGIN_PATH",   _HDF5_PLUGINS),
-]:
-    _curr = os.environ.get(_envvar, "")
-    if _path not in _curr:
-        os.environ[_envvar] = f"{_path}:{_curr}" if _curr else _path
-        _need_reexec = True
-
-if _PYDIR not in sys.path:
-    sys.path.insert(0, _PYDIR)
-
-if _need_reexec:
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+from sdk_bootstrap import activate
+activate()
 
 # ── Normal imports ─────────────────────────────────────────────────────────────
 
 import argparse
+import os
 
 import cv2
 import numpy as np

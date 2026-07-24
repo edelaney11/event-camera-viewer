@@ -3,9 +3,13 @@
 Controls
 --------
 Mouse drag   Draw and apply hardware ROI
+Seek bar     Click/drag to scrub (single-file RAW playback only)
 R            Toggle RAW recording
 H            Toggle HDF5 recording
 M            Rename the last completed recording
+P            Mark a split point at the current playback position (file mode)
+Backspace    Undo the most recent split mark
+X            Split a RAW recording into multiple files (at marks, or by prompt)
 B            Toggle bias control panel
 C            Clear ROI (full sensor)
 +  /  -      Increase / decrease accumulation time (5 ms steps)
@@ -22,6 +26,10 @@ from __future__ import annotations
 
 import itertools
 import os
+import shlex
+import shutil
+import signal
+import subprocess
 import sys
 import threading
 import time
@@ -39,6 +47,7 @@ import numpy as np
 
 from metavision_sdk_core import PeriodicFrameGenerationAlgorithm, ColorPalette
 
+import sdk_bootstrap
 from camera_manager import CameraManager
 from hdf5_writer import HDF5Writer
 from tracker import ObjectTracker
@@ -186,6 +195,20 @@ def _wrap_tokens(tokens: list[str], max_width: int, font_scale: float,
     return lines
 
 
+def _describe_returncode(returncode: int) -> str:
+    """A subprocess.run() returncode with no captured stdout/stderr usually means
+    the process was killed by a signal (POSIX reports that as a negative code)
+    rather than a normal validation failure — decode it so 'exit code -8' reads
+    as 'crashed with signal 8 (SIGFPE)', which points at the external tool
+    itself rather than at bad arguments."""
+    if returncode < 0 and os.name != "nt":
+        try:
+            return f"crashed with signal {-returncode} ({signal.Signals(-returncode).name})"
+        except ValueError:
+            return f"crashed with signal {-returncode}"
+    return f"exit code {returncode}"
+
+
 class EventVisualizer:
     def __init__(
         self,
@@ -197,6 +220,7 @@ class EventVisualizer:
         file_mode: bool = False,
         suite_runner=None,
         playlist=None,
+        source_path: Optional[str] = None,
         tracker_algo: str = "MIL",
         virtual_cam: bool = False,
     ) -> None:
@@ -206,6 +230,7 @@ class EventVisualizer:
         self._file_mode = file_mode  # disables live-only controls when True
         self._suite = suite_runner   # optional SuiteRunner instance
         self._playlist = playlist    # optional PlaylistIterator instance
+        self._source_path = source_path  # path passed via --input, if any
         self._accum_us = accumulation_us
         self._display_fps = display_fps
 
@@ -229,6 +254,23 @@ class EventVisualizer:
         self._current_raw_path: Optional[str] = None
         self._last_recording_path: Optional[str] = None
         self._last_recording_kind: Optional[str] = None
+
+        # ── Split points marked during file playback (µs, file-relative) ──────
+        self._split_marks_us: list[int] = []
+        self._last_playlist_name: Optional[str] = None
+
+        # ── Seek bar, custom-drawn in the HUD (single-file RAW playback only —
+        # duck-typed on the iterator exposing seek()/duration_us, which only
+        # RawEventsIterator does) ──────────────────────────────────────────────
+        self._seekable: bool = file_mode and playlist is None and hasattr(iterator, "seek")
+        self._seek_duration_us: Optional[int] = None
+        self._seek_bar_rect: Optional[tuple[int, int, int, int]] = None  # x0,y0,x1,y1 — hit region
+        self._seek_dragging: bool = False
+        # While not None, drawn instead of the live position — covers the gap
+        # between requesting a seek and the background thread's events catching
+        # up to it, so a click/drag doesn't visually snap back before that happens.
+        self._seek_override_frac: Optional[float] = None
+        self._seek_override_until: float = 0.0
 
         # ── ROI drag state ───────────────────────────────────────────────────
         self._roi_drawing = False
@@ -417,6 +459,235 @@ class EventVisualizer:
         self._last_recording_path = new_path
         print(f"Renamed recording: {filename} -> {os.path.basename(new_path)}")
 
+    # ── Seek bar, custom-drawn (single-file RAW playback only) ─────────────────
+    # A native cv2.createTrackbar was tried first, but forcing its position every
+    # frame to track playback (cv2.setTrackbarPos) fought with the user's own
+    # click/drag, and it doesn't lay out well alongside the custom-drawn HUD.
+    # Drawing it ourselves — same technique as _draw_suite_bar — sidesteps both.
+
+    def _init_seek_duration(self) -> None:
+        """Read the file's total duration up front, if this playback session
+        supports seeking (a one-off full-file scan, cached to a sidecar JSON by
+        the SDK) — failure here just disables the seek bar, not playback."""
+        if not self._seekable:
+            return
+        try:
+            duration_us = self._iterator.duration_us
+        except Exception as exc:
+            print(f"[WARN] Could not determine RAW duration for seek bar: {exc}", file=sys.stderr)
+            self._seekable = False
+            return
+        if duration_us <= 0:
+            self._seekable = False
+            return
+        self._seek_duration_us = duration_us
+
+    def _seek_to(self, frac: float) -> None:
+        frac = min(max(frac, 0.0), 1.0)
+        if not self._seek_duration_us:
+            return
+        target_us = int(frac * self._seek_duration_us)
+        self._iterator.seek(target_us)
+        if self._ts_surface is not None:
+            self._ts_surface[:] = -1
+            self._pol_surface[:] = 0
+        self._seek_override_frac = frac
+        self._seek_override_until = time.monotonic() + 1.0
+        print(f"[SEEK] {target_us / 1_000_000:.3f}s / {self._seek_duration_us / 1_000_000:.3f}s")
+
+    def _draw_seek_bar(self, out: np.ndarray, y0: int, W: int, ts_us: int) -> None:
+        duration = self._seek_duration_us or 0
+        live_frac = min(max(ts_us / duration, 0.0), 1.0) if duration > 0 else 0.0
+
+        if self._seek_override_frac is not None:
+            # Drop the override once real playback has caught up to roughly
+            # where we jumped, or after a timeout (e.g. a sparse region).
+            if abs(live_frac - self._seek_override_frac) < 0.01 or time.monotonic() > self._seek_override_until:
+                self._seek_override_frac = None
+
+        frac = self._seek_override_frac if self._seek_override_frac is not None else live_frac
+
+        bar_x0, bar_x1 = 8, W - 90
+        bar_y0, bar_y1 = y0 + 5, y0 + 15
+        r = (bar_y1 - bar_y0) // 2
+        fill_x1 = bar_x0 + int((bar_x1 - bar_x0) * frac)
+
+        _rounded_bar(out, bar_x0, bar_y0, bar_x1, bar_y1, (70, 68, 78))
+        if fill_x1 > bar_x0:
+            _rounded_bar(out, bar_x0, bar_y0, max(fill_x1, bar_x0 + 2 * r), bar_y1, _HUD_ACCENT)
+
+        time_str = f"{frac * duration / 1e6:.1f}/{duration / 1e6:.1f}s"
+        cv2.putText(out, time_str, (bar_x1 + 6, y0 + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, _HUD_TEXT, 1, cv2.LINE_AA)
+
+        # A bit taller than the drawn bar so it's easy to click, not pixel-perfect.
+        self._seek_bar_rect = (bar_x0, bar_y0 - 6, bar_x1, bar_y1 + 6)
+
+    # ── Split a RAW recording into multiple files (tkinter dialog) ─────────────
+
+    def _split_source_candidate(self) -> Optional[str]:
+        """Best-guess path of a .raw file the user probably wants to split:
+        the file currently loaded in playlist/file playback mode, or the most
+        recently completed live RAW recording."""
+        if self._playlist is not None:
+            path = self._playlist.current_path
+            return path if path.lower().endswith(".raw") else None
+        if self._file_mode and self._source_path and self._source_path.lower().endswith(".raw"):
+            return self._source_path
+        if self._last_recording_kind == "RAW" and self._last_recording_path:
+            return self._last_recording_path
+        return None
+
+    def _find_file_cutter(self) -> tuple[Optional[str], list]:
+        """Path to metavision_file_cutter, plus any shared-library dirs it
+        needs on LD_LIBRARY_PATH/PATH — see sdk_bootstrap.find_tool()."""
+        return sdk_bootstrap.find_tool("metavision_file_cutter")
+
+    def _mark_split_point(self) -> None:
+        """Drop a split point at the current playback position (file mode only —
+        live timestamps aren't relative to a recording's start, so marks would
+        not line up with the file offsets metavision_file_cutter expects)."""
+        if not self._file_mode:
+            print("[INFO] Split points are only available during file playback.", file=sys.stderr)
+            return
+        with self._frame_lock:
+            ts_us = self._latest_ts_us
+        if self._split_marks_us and ts_us <= self._split_marks_us[-1]:
+            print("[SPLIT] Already marked at or past this point.", file=sys.stderr)
+            return
+        self._split_marks_us.append(ts_us)
+        print(
+            f"[SPLIT] Marked point at {ts_us / 1_000_000:.3f}s "
+            f"({len(self._split_marks_us)} total) — X to cut, Backspace to undo."
+        )
+
+    def _undo_split_point(self) -> None:
+        if not self._split_marks_us:
+            return
+        removed = self._split_marks_us.pop()
+        print(f"[SPLIT] Removed mark at {removed / 1_000_000:.3f}s ({len(self._split_marks_us)} remaining).")
+
+    def _split_raw_file(self) -> None:
+        src = self._split_source_candidate()
+        if src is None:
+            print("[INFO] No RAW file available to split.", file=sys.stderr)
+            return
+        if not os.path.exists(src):
+            print(f"[WARN] RAW file no longer exists: {src}", file=sys.stderr)
+            return
+
+        cutter, cutter_native_dirs = self._find_file_cutter()
+        if cutter is None:
+            print(
+                "[WARN] metavision_file_cutter not found on PATH — cannot split RAW files.",
+                file=sys.stderr,
+            )
+            return
+
+        # Base: the environment as a shell would have it, not this process's
+        # own (bootstrap-modified) one — metavision_file_cutter may be a
+        # completely different build from whichever SDK this process's own
+        # imports resolved to (e.g. a system package alongside a self-built
+        # OpenEB install), and handing it our LD_LIBRARY_PATH can point its
+        # dynamic linker at a mismatched shared library and crash it
+        # (observed: SIGFPE, reproducible only when launched from this app).
+        #
+        # But if the tool was instead found inside a detected install's own
+        # bin/ dir (no separate system package — cutter_native_dirs non-empty
+        # in that case), it's a sibling of that install and, lacking a baked-
+        # in rpath, needs that same install's lib dir on LD_LIBRARY_PATH/PATH
+        # to find its own dependencies (observed elsewhere: "cannot open
+        # shared object file" for libmetavision_sdk_stream.so.5).
+        cutter_env = sdk_bootstrap.original_env()
+        if cutter_native_dirs:
+            path_var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
+            existing = cutter_env.get(path_var, "")
+            parts = [d for d in cutter_native_dirs if d not in existing.split(os.pathsep)]
+            if parts:
+                cutter_env[path_var] = os.pathsep.join(parts + ([existing] if existing else []))
+
+        try:
+            from metavision_core.event_io import get_raw_info
+            duration_us = get_raw_info(src)["duration"]
+        except Exception as exc:
+            print(f"[WARN] Could not read RAW file duration: {exc}", file=sys.stderr)
+            return
+        if duration_us <= 0:
+            print("[WARN] RAW file appears to be empty — nothing to split.", file=sys.stderr)
+            return
+        duration_s = duration_us / 1_000_000
+
+        # Prefer points marked during playback (P) over the manual-entry dialog.
+        # Both paths produce `points_s`: absolute cut-point timestamps (seconds
+        # from the start of the file) — the same thing P prints when marking,
+        # so values can be copied straight from that output into the dialog.
+        using_marks = self._file_mode and bool(self._split_marks_us)
+        if using_marks:
+            points_s = sorted({t / 1_000_000 for t in self._split_marks_us if 0 < t < duration_us})
+            if not points_s:
+                print("[WARN] Marked points are outside the file's duration — ignoring them.", file=sys.stderr)
+                using_marks = False
+            else:
+                print(f"[SPLIT] Using {len(points_s)} marked point(s): " +
+                      ", ".join(f"{p:.3f}s" for p in points_s))
+
+        if not using_marks:
+            self._ensure_tk_master()
+            points_str = simpledialog.askstring(
+                "Split RAW Recording",
+                f"{os.path.basename(src)} is {duration_s:.3f}s long.\n"
+                "Enter split points in seconds, comma-separated (e.g. 5,15,22.5) —\n"
+                "the moments to cut at, not each part's length.",
+                parent=self._tk_master,
+            )
+            if not points_str or not points_str.strip():
+                return
+
+            try:
+                points_s = sorted({
+                    float(tok.strip().rstrip("sS ").strip())
+                    for tok in points_str.split(",") if tok.strip()
+                })
+            except ValueError:
+                print(f"[WARN] Could not parse split points: {points_str!r}", file=sys.stderr)
+                return
+            points_s = [p for p in points_s if 0 < p < duration_s]
+            if not points_s:
+                print("[WARN] No valid split points inside the file's duration.", file=sys.stderr)
+                return
+
+        boundaries = [0.0] + points_s + [duration_s]
+        num_parts = len(boundaries) - 1
+        directory, filename = os.path.split(src)
+        stem, ext = os.path.splitext(filename)
+        idx_width = len(str(num_parts))
+
+        print(f"[SPLIT] Splitting {filename} ({duration_s:.3f}s) into {num_parts} parts…")
+        written = 0
+        for i in range(num_parts):
+            start_s, end_s = boundaries[i], boundaries[i + 1]
+            out_name = f"{stem}_part{i + 1:0{idx_width}d}of{num_parts}{ext}"
+            out_path = os.path.join(directory, out_name)
+            cmd = [cutter, "-i", src, "-o", out_path, "-s", f"{start_s:.6f}", "-e", f"{end_s:.6f}"]
+            result = subprocess.run(cmd, capture_output=True, text=True, env=cutter_env)
+            if result.returncode != 0:
+                detail = result.stderr.strip() or result.stdout.strip()
+                if not detail:
+                    detail = _describe_returncode(result.returncode)
+                print(f"[WARN] Part {i + 1}/{num_parts} failed: {detail}", file=sys.stderr)
+                print(f"       command: {shlex.join(cmd)}", file=sys.stderr)
+            else:
+                written += 1
+                print(f"[SPLIT] {i + 1}/{num_parts}: {out_name}  ({start_s:.3f}s–{end_s:.3f}s)")
+
+        if written:
+            print(f"[SPLIT] Done — {written}/{num_parts} files written to {directory or '.'}")
+        else:
+            print("[SPLIT] Failed — no output files were written.", file=sys.stderr)
+
+        if using_marks:
+            self._split_marks_us.clear()
+
     # ── Bias panel (tkinter) ──────────────────────────────────────────────────
 
     def _ensure_tk_master(self) -> None:
@@ -592,6 +863,20 @@ class EventVisualizer:
     # ── Mouse callback (ROI drawing) ──────────────────────────────────────────
 
     def _mouse_cb(self, event: int, x: int, y: int, flags: int, param) -> None:
+        if self._seekable and self._seek_bar_rect is not None:
+            bx0, by0, bx1, by1 = self._seek_bar_rect
+            if event == cv2.EVENT_LBUTTONDOWN and bx0 <= x <= bx1 and by0 <= y <= by1:
+                self._seek_dragging = True
+                self._seek_to((x - bx0) / max(bx1 - bx0, 1))
+                return
+            if self._seek_dragging:
+                if event == cv2.EVENT_MOUSEMOVE:
+                    self._seek_to((x - bx0) / max(bx1 - bx0, 1))
+                    return
+                if event == cv2.EVENT_LBUTTONUP:
+                    self._seek_dragging = False
+                    return
+
         if self._tracker_selecting:
             if event == cv2.EVENT_LBUTTONDOWN:
                 self._tracker_drag_start = (x, y)
@@ -649,6 +934,14 @@ class EventVisualizer:
         out = frame  # draw in-place — caller already owns this copy
         W, H = out.shape[1], out.shape[0]
 
+        # Split marks are file-relative — drop them when the playlist advances
+        # to a different file (whether via [ / ] or auto-advance at EOF).
+        if self._playlist is not None:
+            name = self._playlist.current_name
+            if self._last_playlist_name is not None and name != self._last_playlist_name:
+                self._split_marks_us.clear()
+            self._last_playlist_name = name
+
         # Committed ROI
         if self._active_roi is not None:
             x0, y0, x1, y1 = self._active_roi
@@ -691,6 +984,9 @@ class EventVisualizer:
         if self._file_mode:
             speed_label = "MAX" if self._replay_speed == 0 else f"x{self._replay_speed:g}"
             badges.append((speed_label, _HUD_ACCENT))
+        if self._file_mode and self._split_marks_us:
+            n = len(self._split_marks_us)
+            badges.append((f"{n} MARK" + ("S" if n != 1 else ""), _HUD_ROI))
 
         gap = 6
         badges_w = sum(_pill_size(t)[0] + gap for t, _ in badges) if badges else 0
@@ -721,11 +1017,11 @@ class EventVisualizer:
         # playlist bars above it can be positioned against its real height —
         # it can wrap to more than one line on narrow frames like the GenX320's.
         if self._playlist is not None:
-            hint = "[/:prev  ]:next  ,/.:speed  +/-:accum  Spc:pause  S:snap  Q:quit"
+            hint = "[/:prev  ]:next  ,/.:speed  +/-:accum  Spc:pause  S:snap  P:mark  X:split  Q:quit"
         elif self._file_mode:
-            hint = ",/.:speed  +/-:accum  Spc:pause  S:snap  K:track  Q:quit"
+            hint = ",/.:speed  +/-:accum  Spc:pause  S:snap  K:track  P:mark  X:split  Q:quit"
         else:
-            hint = "drag:ROI  O:centreROI  C:clrROI  R:RAW  H:HDF5  M:rename  B:biases  F:filters  K:track  T:suite  +/-:accum  Spc:pause  Q:quit"
+            hint = "drag:ROI  O:centreROI  C:clrROI  R:RAW  H:HDF5  M:rename  X:split  B:biases  F:filters  K:track  T:suite  +/-:accum  Spc:pause  Q:quit"
 
         hint_font = 0.38
         hint_lines = _wrap_tokens(hint.split("  "), W - 12, hint_font)
@@ -738,6 +1034,12 @@ class EventVisualizer:
             suite_y0 = bottom_bar_y0
             _alpha_panel(out, 0, suite_y0, W, suite_y0 + 20)
             self._draw_suite_bar(out, suite_y0, W)
+
+        # Seek bar (above the hint, single-file RAW playback only)
+        if self._seekable:
+            seek_y0 = bottom_bar_y0
+            _alpha_panel(out, 0, seek_y0, W, seek_y0 + 20)
+            self._draw_seek_bar(out, seek_y0, W, ts_us)
 
         # Playlist bar (above the hint, always shown in playlist mode)
         if self._playlist is not None:
@@ -863,6 +1165,7 @@ class EventVisualizer:
         cv2.namedWindow(MAIN_WIN, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(MAIN_WIN, self._cam.width, self._cam.height)
         cv2.setMouseCallback(MAIN_WIN, self._mouse_cb)
+        self._init_seek_duration()
 
         if self._virtual_cam_enabled:
             self._open_virtual_cam()
@@ -1019,6 +1322,15 @@ class EventVisualizer:
                 print("[INFO] Recording not available in file playback mode.")
             else:
                 self._rename_last_recording()
+
+        elif key in (ord("x"), ord("X")):
+            self._split_raw_file()
+
+        elif key in (ord("p"), ord("P")):
+            self._mark_split_point()
+
+        elif key == 8:  # Backspace — undo the most recent split mark
+            self._undo_split_point()
 
         elif key in (ord("b"), ord("B")):
             if self._tk_root is not None:

@@ -54,6 +54,10 @@ class PlaylistIterator:
     def current_name(self) -> str:
         return Path(self._paths[self._index]).name
 
+    @property
+    def current_path(self) -> str:
+        return self._paths[self._index]
+
     def next_file(self) -> None:
         with self._lock:
             if self._index < len(self._paths) - 1:
