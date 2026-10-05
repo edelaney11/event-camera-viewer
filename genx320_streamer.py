@@ -47,11 +47,20 @@ from collections import deque
 import numpy as np
 
 from camera_manager import CameraManager
+from hdf5_reader import EVENT_CD_DTYPE
 
 _HEADER_FMT = "<4sIHH"
 _MAGIC = b"PECD"
 _PROTOCOL_VERSION = 1
 _COUNT_FMT = "<I"
+
+# Client → server commands — see network_reader.NetworkEventsIterator.set_recording(),
+# the only sender. Toggles between this tool's two operating modes: live
+# view (default — discard backlog on reconnect, see queue.clear() below) and
+# lossless capture (preserve backlog across a reconnect instead), for
+# whatever span the client is actually recording what it receives.
+_CMD_STOP_RECORDING = 0x00
+_CMD_START_RECORDING = 0x01
 
 # Cap on how much backlog gets coalesced into a single network message —
 # bounds worst-case message size without meaningfully limiting how much a
@@ -65,13 +74,12 @@ _POP_POLL_S = 0.2
 
 class EventQueue:
     """Thread-safe hand-off between the camera pump thread (producer) and the
-    socket-writer loop (consumer). See tcp_event_streamer.cpp's EventQueue
-    for the rationale this mirrors: max_queued_events is an OOM circuit
-    breaker, NOT a lag/latency control — for lossless capture, backlog must
-    be allowed to grow through a burst and drain later rather than be
-    discarded. It only exists so a truly pathological, sustained overload
-    degrades (by dropping, loudly) rather than exhausting memory.
-    """
+    socket-writer loop (consumer). max_queued_events is an OOM circuit
+    breaker (dropping, loudly, under a sustained overload) for backlog that
+    accumulates *within* a connection (client briefly slower than the
+    camera) or between connections (before a client has (re)connected) — not
+    a guarantee that backlog ever reaches a client, since a fresh connection
+    discards it; see clear() and its call site in main()."""
 
     def __init__(self, max_queued_events: int) -> None:
         self._max = max_queued_events
@@ -81,8 +89,14 @@ class EventQueue:
         self._dropped = 0
 
     def push(self, batch: np.ndarray) -> None:
-        if batch.size == 0:
-            return
+        # Empty batches ("no new events, but time has passed") are forwarded
+        # too, not dropped — EventsIterator yields these periodically in
+        # delta_t mode, and the client-side frame generator relies on them
+        # for regular timing the same way it does from a local camera (see
+        # visualizer.py's _event_loop, which calls process_events(evs) on
+        # every batch unconditionally). Dropping them here would let a long
+        # idle period collapse into a single large timestamp jump once
+        # events do resume, instead of many small, expected ones.
         with self._cv:
             self._batches.append(batch)
             self._queued += batch.size
@@ -99,6 +113,17 @@ class EventQueue:
             if not self._batches:
                 return None
             return self._batches.popleft()
+
+    def clear(self) -> int:
+        """Discards any queued backlog and returns how many events were
+        dropped. Used when a new client connects — see the call site for why
+        this tool deliberately does NOT preserve backlog across connections
+        (unlike tcp_event_streamer.cpp, which is built for lossless capture)."""
+        with self._cv:
+            dropped = self._queued
+            self._batches.clear()
+            self._queued = 0
+            return dropped
 
     def try_pop(self) -> np.ndarray | None:
         """Non-blocking: pops one already-queued batch, if any. Used to
@@ -138,6 +163,36 @@ def _pump_events(primed_iter, queue: EventQueue, stop_event: threading.Event) ->
         print(f"[ERROR] camera event loop stopped: {exc}", file=sys.stderr)
     finally:
         stop_event.set()
+
+
+def _read_commands(client_sock: socket.socket, recording_event: threading.Event) -> None:
+    """Runs on its own thread for the life of one connection, reading 1-byte
+    commands from the client (network_reader.NetworkEventsIterator.set_recording())
+    concurrently with the main thread's send loop on the same socket — a TCP
+    connection's two directions are independent, so this needs no
+    coordination with the sender beyond the shared recording_event.
+    recording_event is process-level, not per-connection: once the client
+    tells us it's recording, backlog keeps getting preserved (not cleared on
+    reconnect, see main()) across any later disconnect/reconnect, until it
+    explicitly tells us to stop — a dropped connection alone is not
+    distinguished from a deliberate pause, since either way losing data
+    mid-recording is the wrong default. Returns when the client disconnects
+    or the socket errors; does not touch the event queue itself."""
+    try:
+        while True:
+            data = client_sock.recv(1)
+            if not data:
+                return
+            if data[0] == _CMD_START_RECORDING:
+                recording_event.set()
+                print("  Recording started by client — switching to lossless capture "
+                      "(backlog preserved across reconnects).", flush=True)
+            elif data[0] == _CMD_STOP_RECORDING:
+                recording_event.clear()
+                print("  Recording stopped by client — back to live view "
+                      "(backlog discarded on reconnect).", flush=True)
+    except OSError:
+        return
 
 
 def _make_listen_socket(bind_addr: str, port: int) -> socket.socket:
@@ -200,13 +255,17 @@ def main() -> int:
         return 1
     print(f"Listening on {args.bind}:{args.port}", flush=True)
 
-    # Prime the generator on the main thread so the SDK's native __enter__
-    # (inside EventsIterator.__iter__) runs here, not in the background
-    # thread — same convention as visualizer.py's own live-camera loop.
-    primed_iter = iter(camera.get_iterator(delta_t_us=args.slice_us))
-
     queue = EventQueue(args.max_queued_events)
     stop_event = threading.Event()
+    # None until the first client connects — see the "pump_thread is None"
+    # branch below. Not started at process launch: pulling (and queuing)
+    # events from the camera before anyone is listening is what produced a
+    # multi-million-event backlog in testing, which then got dumped on the
+    # first connecting client all at once and crashed it.
+    pump_thread: threading.Thread | None = None
+    # Process-level, not per-connection — see _read_commands()'s docstring
+    # for why it deliberately survives a disconnect/reconnect.
+    recording_event = threading.Event()
 
     def _handle_stop(signum, frame) -> None:
         stop_event.set()
@@ -217,10 +276,8 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_stop)
     signal.signal(signal.SIGINT, _handle_stop)
 
-    pump_thread = threading.Thread(target=_pump_events, args=(primed_iter, queue, stop_event), daemon=True)
-    pump_thread.start()
-
     header = struct.pack(_HEADER_FMT, _MAGIC, _PROTOCOL_VERSION, camera.width, camera.height)
+    print("Waiting for a client before pulling any events from the camera …", flush=True)
 
     try:
         while not stop_event.is_set():
@@ -230,15 +287,42 @@ def main() -> int:
                 continue
             client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-            backlog = queue.queued_events()
-            msg = f"Client connected: {client_addr[0]}"
-            if backlog:
-                msg += f"  ({backlog} backlogged events queued since the last connection — delivering those first, oldest first)"
-            print(msg, flush=True)
-            dropped = queue.take_dropped()
-            if dropped:
-                print(f"  ({dropped} events LOST while no client was connected — "
-                      f"hit --max-queued-events; raise it if this recurs)", file=sys.stderr)
+            if pump_thread is None:
+                # Prime the generator on the main thread so the SDK's native
+                # __enter__ (inside EventsIterator.__iter__) runs here, not
+                # on the background thread — same convention as
+                # visualizer.py's own live-camera loop. Only done once: later
+                # reconnects reuse the already-running pump/queue.
+                primed_iter = iter(camera.get_iterator(delta_t_us=args.slice_us))
+                pump_thread = threading.Thread(
+                    target=_pump_events, args=(primed_iter, queue, stop_event), daemon=True
+                )
+                pump_thread.start()
+                print("First client connected — camera event stream started.", flush=True)
+
+            # Discard any backlog that piled up while no client was connected
+            # (including before the very first connection — the camera has
+            # been producing events since camera.open(), with nobody to
+            # receive them) UNLESS the client told us (via set_recording())
+            # it's actively recording what it receives — in which case this
+            # is a reconnect mid-recording, and losing the gap would defeat
+            # the point of recording at all, so the backlog is preserved
+            # instead (bounded only by --max-queued-events, same as
+            # tcp_event_streamer.cpp). Outside of that, a stale backlog
+            # delivered all at once forces the client's frame generator to
+            # synchronously render every elapsed time-slice across that
+            # whole span in one burst — the input shape that crashed the
+            # viewer in testing — so plain live view defaults to discarding it.
+            if recording_event.is_set():
+                stale = 0
+                print(f"Client connected: {client_addr[0]}  (recording still active — backlog preserved)", flush=True)
+            else:
+                stale = queue.clear()
+                queue.take_dropped()  # also reset — stale already covers it
+                msg = f"Client connected: {client_addr[0]}"
+                if stale:
+                    msg += f"  (discarded {stale} stale backlogged events — starting live)"
+                print(msg, flush=True)
 
             try:
                 client_sock.sendall(header)
@@ -247,9 +331,9 @@ def main() -> int:
                 client_sock.close()
                 continue
 
-            # Deliberately NOT clearing the queue here: any backlog that
-            # built up while no client was connected gets delivered to this
-            # client, oldest-first, rather than silently discarded.
+            cmd_thread = threading.Thread(target=_read_commands, args=(client_sock, recording_event), daemon=True)
+            cmd_thread.start()
+
             client_ok = True
             last_status = time.monotonic()
             while client_ok and not stop_event.is_set():
@@ -279,7 +363,19 @@ def main() -> int:
                         break
                     parts.append(extra)
                     total += extra.size
-                batch = parts[0] if len(parts) == 1 else np.concatenate(parts)
+                # dtype=EVENT_CD_DTYPE is required here, not cosmetic:
+                # np.concatenate() on an "aligned" structured dtype (ours has
+                # explicit padding between p and t, offsets=[0,2,4,8],
+                # itemsize=16 — see EVENT_CD_DTYPE) silently repacks its
+                # *output* to the minimal packed layout (itemsize=14, no
+                # padding) unless told otherwise, even though every input
+                # array keeps the padded 16-byte layout. The result still
+                # has x/y/p/t fields and looks correct in Python — only
+                # .tobytes() reveals it's now 14 bytes/event, not the 16 the
+                # wire protocol's `count` field and the client both assume,
+                # desyncing the stream on every single message after it.
+                # Forcing the dtype here keeps concatenate's output padded.
+                batch = parts[0] if len(parts) == 1 else np.concatenate(parts, dtype=EVENT_CD_DTYPE)
 
                 payload = struct.pack(_COUNT_FMT, batch.size) + batch.tobytes()
                 try:
@@ -295,7 +391,8 @@ def main() -> int:
         print("Shutting down …", flush=True)
         stop_event.set()
         listen_sock.close()
-        pump_thread.join(timeout=2.0)
+        if pump_thread is not None:
+            pump_thread.join(timeout=2.0)
         camera.close()
     return 0
 

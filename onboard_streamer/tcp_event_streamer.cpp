@@ -327,13 +327,6 @@ int main(int argc, char *argv[]) {
     std::cerr << "Listening on " << bind_addr << ":" << port << std::endl;
 
     EventQueue queue(max_queued_events);
-    camera.cd().add_callback(
-        [&queue](const Prophesee::EventCD *begin, const Prophesee::EventCD *end) { queue.push(begin, end); });
-
-    camera.add_runtime_error_callback(
-        [](const Prophesee::CameraException &e) { std::cerr << "Runtime error: " << e.what() << std::endl; });
-
-    camera.start();
 
     WireHeader header{};
     std::memcpy(header.magic, "PECD", 4);
@@ -341,7 +334,16 @@ int main(int argc, char *argv[]) {
     header.width = static_cast<uint16_t>(geometry.width());
     header.height = static_cast<uint16_t>(geometry.height());
 
-    while (!g_signal_caught && camera.is_running()) {
+    // Not started yet: the camera's CD callback and camera.start() are
+    // deferred to the first accepted connection (see below), instead of
+    // running from process launch regardless of whether anyone is
+    // listening. Pulling (and queuing) events before any client exists has
+    // no recipient for that data and only grows an unbounded backlog for no
+    // reason — camera.is_running() is therefore not a valid loop condition
+    // until after that first start(), hence camera_started below.
+    bool camera_started = false;
+
+    while (!g_signal_caught && (!camera_started || camera.is_running())) {
         sockaddr_in client_addr{};
         socklen_t client_len = sizeof(client_addr);
         int client_fd = ::accept(listen_fd, reinterpret_cast<sockaddr *>(&client_addr), &client_len);
@@ -353,6 +355,17 @@ int main(int argc, char *argv[]) {
         }
         int nodelay = 1;
         ::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+        if (!camera_started) {
+            camera.cd().add_callback([&queue](const Prophesee::EventCD *begin, const Prophesee::EventCD *end) {
+                queue.push(begin, end);
+            });
+            camera.add_runtime_error_callback(
+                [](const Prophesee::CameraException &e) { std::cerr << "Runtime error: " << e.what() << std::endl; });
+            camera.start();
+            camera_started = true;
+            std::cerr << "First client connected — camera started." << std::endl;
+        }
 
         char client_ip[INET_ADDRSTRLEN];
         ::inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
@@ -443,7 +456,8 @@ int main(int argc, char *argv[]) {
 
     std::cerr << "Shutting down..." << std::endl;
     queue.stop();
-    camera.stop();
+    if (camera_started)
+        camera.stop();
     ::close(listen_fd);
     return 0;
 }

@@ -104,6 +104,8 @@ python main.py --tcp <pi-ip>:9000
 ```
 This gets you the full live viewer — bias/ROI panels, recording, tracking — driven by events arriving over the network, exactly as if the GenX320 were plugged directly into your machine. `record_headless.py`'s own RAW recording and `genx320_streamer.py` both need exclusive access to the camera, so don't run both at once.
 
+`genx320_streamer.py` doesn't start pulling events from the camera until a client actually connects (and discards anything already queued if a client reconnects later) — it's fine to leave it running on the Pi for a long time before you ever open the viewer; it won't hand you a backlog of everything that happened while nobody was watching.
+
 To run it as a systemd service the same way as `genx320-record` (see above), use [`systemd/genx320-streamer.service`](systemd/genx320-streamer.service) in place of `genx320-record.service` — same setup steps, same `genx320-setup` dependency, just swap which unit you enable.
 
 ## Quickstart

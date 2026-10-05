@@ -387,12 +387,20 @@ class EventVisualizer:
         with self._hdf5_lock:
             self._hdf5_writer = writer
             self._hdf5_pending.clear()
+        # Over --tcp (genx320_streamer.py), tells the server to stop
+        # discarding its backlog on a reconnect — lossless capture for as
+        # long as we're actually recording. A no-op for every other
+        # iterator (file/playlist/live-camera), which don't have this method.
+        if hasattr(self._iterator, "set_recording"):
+            self._iterator.set_recording(True)
         print(f"HDF5 recording started: {path}")
 
     def _stop_hdf5(self) -> None:
         with self._hdf5_lock:
             writer, self._hdf5_writer = self._hdf5_writer, None
             pending, self._hdf5_pending = self._hdf5_pending, []
+        if hasattr(self._iterator, "set_recording"):
+            self._iterator.set_recording(False)
         if writer is not None:
             for batch in pending:
                 writer.write(batch)

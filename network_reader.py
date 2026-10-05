@@ -41,6 +41,27 @@ _COUNT_SIZE = struct.calcsize(_COUNT_FMT)
 
 _CONNECT_TIMEOUT_S = 10.0
 
+# Sanity cap on a single batch's event count — comfortably above both
+# tcp_event_streamer.cpp's and genx320_streamer.py's own coalescing cap
+# (200,000), so legitimate traffic never trips it. A random/garbage count
+# (e.g. from a desynced stream after a framing bug) is overwhelmingly likely
+# to exceed this, so treating it as an error here — rather than trying to
+# recv() and decode whatever it implies — turns silent data corruption that
+# would otherwise reach the SDK's frame-generation code (which assumes
+# well-formed, time-sorted input and does not itself validate it) into a
+# clear, early Python exception instead of undefined native-code behavior.
+_MAX_EVENTS_PER_BATCH = 2_000_000
+
+# Client → server commands (the only bytes ever sent the other way on this
+# connection). Understood by genx320_streamer.py: it starts in a discard-
+# backlog-on-reconnect "live view" mode, and these switch it to/from a
+# lossless mode that preserves backlog across a reconnect instead, for the
+# duration of an actual recording. tcp_event_streamer.cpp doesn't read these
+# (it's unconditionally lossless once a client connects) — harmless, unread
+# bytes left sitting in its receive buffer.
+_CMD_STOP_RECORDING = b"\x00"
+_CMD_START_RECORDING = b"\x01"
+
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
     """Block until exactly n bytes have been read (recv() may return short)."""
@@ -100,10 +121,44 @@ class NetworkEventsIterator:
         while not self._closed:
             try:
                 (count,) = struct.unpack(_COUNT_FMT, _recv_exact(self._sock, _COUNT_SIZE))
+            except ConnectionError:
+                return
+            if count > _MAX_EVENTS_PER_BATCH:
+                raise RuntimeError(
+                    f"implausible event count ({count}) received in one batch — the TCP "
+                    "stream appears desynced; refusing to decode it as events"
+                )
+            try:
                 raw = _recv_exact(self._sock, count * EVENT_CD_DTYPE.itemsize) if count else b""
             except ConnectionError:
                 return
-            yield np.frombuffer(raw, dtype=EVENT_CD_DTYPE)
+            # .copy() rather than handing out the frombuffer() view directly:
+            # that view is read-only (backed by an immutable bytes object),
+            # and downstream native SDK calls (PeriodicFrameGenerationAlgorithm
+            # et al.) assume ordinary writable event arrays like the ones
+            # EventsIterator produces locally — pass this straight through
+            # without ever confirming a read-only buffer is actually safe there.
+            batch = np.frombuffer(raw, dtype=EVENT_CD_DTYPE).copy()
+            if batch.size > 1 and (np.diff(batch["t"].astype(np.int64)) < 0).any():
+                raise RuntimeError(
+                    "received a non-monotonic event batch over the network — the TCP "
+                    "stream appears desynced"
+                )
+            yield batch
+
+    def set_recording(self, active: bool) -> None:
+        """Tells the server to start/stop treating its backlog as something
+        that must survive a reconnect (lossless), for as long as this client
+        is actually recording what it receives — see visualizer.py's
+        _start_hdf5()/_stop_hdf5(), the only callers. Safe to call
+        concurrently with __iter__ consuming the same socket from another
+        thread (independent send/recv directions on one TCP connection).
+        Best-effort: if the connection is already dead, the iterator side
+        will discover that on its own on the next read."""
+        try:
+            self._sock.sendall(_CMD_START_RECORDING if active else _CMD_STOP_RECORDING)
+        except OSError:
+            pass
 
     def close(self) -> None:
         self._closed = True
