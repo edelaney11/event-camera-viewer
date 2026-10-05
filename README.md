@@ -89,6 +89,23 @@ To control it remotely over SSH, wrap it in the systemd units under [`systemd/`]
    ```
 `genx320-record` is intentionally left disabled (not started on boot) so recording is something you trigger on demand — enable it too (`systemctl enable`) only if you actually want it to start recording automatically at power-on.
 
+### Remote live view (Raspberry Pi over the network)
+
+`main.py --tcp HOST:PORT` connects to *any* camera being streamed over a plain TCP socket, instead of opening a local camera or file — the same mechanism already used for a Prophesee Onboard (see [`onboard_streamer/tcp_event_streamer.cpp`](onboard_streamer/tcp_event_streamer.cpp)). [`genx320_streamer.py`](genx320_streamer.py) is a pure-Python server implementing the same wire protocol for the GenX320 (or any camera this repo's `camera_manager.py` can open) — useful when the Pi has no display attached and you'd rather view/record from your main machine than run `main.py` directly over SSH + X-forwarding.
+
+On the Pi (after the usual `dtoverlay`/`rp5_setup_v4l.sh` boot steps from the previous section):
+```bash
+python genx320_streamer.py --port 9000
+```
+
+From any other machine on the same network, running a plain OpenEB build (no RPi V4L2 patch needed — the client never touches the sensor directly):
+```bash
+python main.py --tcp <pi-ip>:9000
+```
+This gets you the full live viewer — bias/ROI panels, recording, tracking — driven by events arriving over the network, exactly as if the GenX320 were plugged directly into your machine. `record_headless.py`'s own RAW recording and `genx320_streamer.py` both need exclusive access to the camera, so don't run both at once.
+
+To run it as a systemd service the same way as `genx320-record` (see above), use [`systemd/genx320-streamer.service`](systemd/genx320-streamer.service) in place of `genx320-record.service` — same setup steps, same `genx320-setup` dependency, just swap which unit you enable.
+
 ## Quickstart
 
 Live view from the first camera found:
@@ -242,7 +259,10 @@ All subcommands accept `--label-a`/`--label-b` to name the runs being compared; 
 event-camera-viewer/
 ├── main.py              Live viewer / playback CLI entry point
 ├── record_headless.py   No-GUI RAW recording for headless/remote deployments
-├── systemd/             Unit files for record_headless.py on a headless Raspberry Pi
+├── genx320_streamer.py  No-GUI TCP event streaming for headless/remote deployments
+├── network_reader.py    TCP client for genx320_streamer.py / tcp_event_streamer.cpp (--tcp)
+├── onboard_streamer/    C++ TCP event streamer for a Prophesee Onboard
+├── systemd/             Unit files for record_headless.py/genx320_streamer.py on a headless Raspberry Pi
 ├── camera_manager.py    HAL device wrapper (biases, ROI, RAW recording)
 ├── visualizer.py        OpenCV display, controls, recording
 ├── hdf5_reader.py       Custom HDF5 event format reader

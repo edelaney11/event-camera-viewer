@@ -4,6 +4,9 @@
 Live camera:
     python main.py [--serial <SN>] [--slice-us 10000] [--fps 30] [--accum-us 20000]
 
+Live camera over TCP (e.g. a Prophesee Onboard running tcp_event_streamer):
+    python main.py --tcp 169.254.10.10:9000
+
 File playback:
     python main.py --input recording_20240101_120000.hdf5 [--speed 1.0]
 
@@ -30,10 +33,12 @@ from visualizer import EventVisualizer
 
 
 class _FileCameraStub:
-    """Minimal stand-in for CameraManager when playing back a file.
+    """Minimal stand-in for CameraManager when playing back a file, or when
+    streaming a live camera over TCP (--tcp) — neither case has local HAL
+    access to a physical device.
 
     Provides the same interface that EventVisualizer reads but takes no
-    action (no physical camera is attached).
+    action.
     """
 
     def __init__(self, width: int, height: int) -> None:
@@ -88,6 +93,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--serial", default="",
         help="Camera serial number (blank = first found). Ignored with --input.",
+    )
+    p.add_argument(
+        "--tcp", metavar="HOST:PORT",
+        help="Connect to a camera streamed over TCP (a Prophesee Onboard running "
+             "tcp_event_streamer, or a GenX320/other camera running "
+             "genx320_streamer.py — same wire protocol, either works) instead of "
+             "a local camera or file, e.g. --tcp 169.254.10.10:9000. See "
+             "onboard_streamer/tcp_event_streamer.cpp and genx320_streamer.py.",
     )
     # ── Common ──
     p.add_argument(
@@ -187,6 +200,32 @@ def main() -> int:
             iterator=it,
             file_mode=True,
             source_path=args.input,
+            tracker_algo=args.tracker_algo,
+            virtual_cam=args.virtual_cam,
+        )
+        try:
+            viz.run()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            it.close()
+
+    elif args.tcp:
+        # ── Live camera over TCP (e.g. Prophesee Onboard) ───────────────────────
+        from network_reader import NetworkEventsIterator
+        try:
+            it = NetworkEventsIterator(args.tcp)
+        except Exception as exc:
+            print(f"Error: could not connect to {args.tcp} — {exc}", file=sys.stderr)
+            return 1
+
+        camera: CameraManager = _FileCameraStub(it.width, it.height)  # type: ignore[assignment]
+        viz = EventVisualizer(
+            camera,
+            delta_t_us=args.slice_us,
+            accumulation_us=args.accum_us,
+            display_fps=args.fps,
+            iterator=it,
             tracker_algo=args.tracker_algo,
             virtual_cam=args.virtual_cam,
         )

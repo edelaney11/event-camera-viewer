@@ -14,3 +14,10 @@ snapshot_*.png
 suite_output*/
 plots*/
 rate_plots*/
+car_out_back/
+g018_sideways/
+g018_straight/
+
+
+# Onboard code
+onboard_references/

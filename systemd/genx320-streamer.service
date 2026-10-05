@@ -1,0 +1,19 @@
+[Unit]
+Description=GenX320 event streamer (TCP)
+After=genx320-setup.service network.target
+Requires=genx320-setup.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/repos/event-camera-viewer
+# Adjust the interpreter path if not using a venv at .venv, and --port if you
+# don't want the default 9000. Mutually exclusive with genx320-record.service
+# — both need exclusive access to the camera, so only enable one at a time.
+ExecStart=/home/pi/repos/event-camera-viewer/.venv/bin/python genx320_streamer.py
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
