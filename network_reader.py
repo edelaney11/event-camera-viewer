@@ -1,13 +1,11 @@
-"""Read CD events live from a Prophesee Onboard camera over TCP.
+"""Read CD events live from a camera streamed over TCP — a Prophesee Onboard
+running tcp_event_streamer, or a GenX320 running genx320_streamer.py
+(Python) or genx320_streamer_native (C++) — all three speak the identical
+wire protocol below, so this client needs no knowledge of which one is on
+the other end.
 
-Connects to a tcp_event_streamer instance (see onboard_streamer/) running on
-the camera's embedded host and yields event batches as numpy structured
-arrays, in the same (x, y, p, t) shape _event_loop (visualizer.py) already
-consumes from RawEventsIterator / HDF5EventsIterator / the SDK's own
-EventsIterator.
-
-Wire protocol (all integers little-endian — both the Onboard's ARM Linux and
-this viewer's x86 Linux host are little-endian, so no byte-swapping is
+Wire protocol (all integers little-endian — both an embedded ARM streamer
+and this viewer's x86 Linux host are little-endian, so no byte-swapping is
 done). See the header comment in onboard_streamer/tcp_event_streamer.cpp
 for the authoritative definition:
 
@@ -22,6 +20,15 @@ for the authoritative definition:
         count * 16-byte events   see EVENT_CD_DTYPE (hdf5_reader.py) —
                                   x:u2, y:u2, p:i2, t:i8, with 2 bytes of
                                   padding between p and t
+
+(An earlier --raw mode here relayed undecoded bytes for this module to
+decode locally via OpenEB's RAW-file machinery, to move decode CPU cost off
+a constrained Pi — abandoned after testing confirmed that machinery
+unconditionally seeks to end-of-file to measure total size, which a live
+stream can never support. See genx320_streamer_native/ for how that CPU
+cost is actually addressed instead: the same wire protocol as here, just
+produced in C++ rather than Python, so the camera's native-code callback
+thread and this protocol's network-send thread aren't serialized by a GIL.)
 """
 from __future__ import annotations
 
@@ -53,12 +60,12 @@ _CONNECT_TIMEOUT_S = 10.0
 _MAX_EVENTS_PER_BATCH = 2_000_000
 
 # Client → server commands (the only bytes ever sent the other way on this
-# connection). Understood by genx320_streamer.py: it starts in a discard-
-# backlog-on-reconnect "live view" mode, and these switch it to/from a
-# lossless mode that preserves backlog across a reconnect instead, for the
-# duration of an actual recording. tcp_event_streamer.cpp doesn't read these
-# (it's unconditionally lossless once a client connects) — harmless, unread
-# bytes left sitting in its receive buffer.
+# connection). Understood by genx320_streamer.py/genx320_streamer_native: a
+# server starts in a discard-backlog-on-reconnect "live view" mode, and
+# these switch it to/from a lossless mode that preserves backlog across a
+# reconnect instead, for the duration of an actual recording.
+# tcp_event_streamer.cpp doesn't read these (it's unconditionally lossless
+# once a client connects) — harmless, unread bytes left in its receive buffer.
 _CMD_STOP_RECORDING = b"\x00"
 _CMD_START_RECORDING = b"\x01"
 
@@ -70,20 +77,21 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
     while remaining > 0:
         chunk = sock.recv(remaining)
         if not chunk:
-            raise ConnectionError("tcp_event_streamer closed the connection")
+            raise ConnectionError("server closed the connection")
         chunks.append(chunk)
         remaining -= len(chunk)
     return chunks[0] if len(chunks) == 1 else b"".join(chunks)
 
 
 class NetworkEventsIterator:
-    """Connects to a running tcp_event_streamer and iterates its CD event
-    stream in whatever batches the streamer sends — no local re-slicing to
-    a fixed delta_t, since PeriodicFrameGenerationAlgorithm only needs
-    monotonically increasing timestamps, not fixed-size chunks.
+    """Connects to a running event streamer (see the module docstring for
+    which ones) and iterates its CD event stream in whatever batches the
+    streamer sends — no local re-slicing to a fixed delta_t, since
+    PeriodicFrameGenerationAlgorithm only needs monotonically increasing
+    timestamps, not fixed-size chunks.
 
     Args:
-        address: "host:port" of the tcp_event_streamer instance, e.g.
+        address: "host:port" of the streamer instance, e.g.
                   "169.254.10.10:9000".
     """
 
@@ -106,7 +114,7 @@ class NetworkEventsIterator:
 
         if magic != _MAGIC:
             self._sock.close()
-            raise ConnectionError(f"{address} is not a tcp_event_streamer (bad magic {magic!r})")
+            raise ConnectionError(f"{address} is not a recognized event streamer (bad magic {magic!r})")
         if version != _PROTOCOL_VERSION:
             self._sock.close()
             raise ConnectionError(f"Unsupported protocol version {version} from {address} (expected {_PROTOCOL_VERSION})")

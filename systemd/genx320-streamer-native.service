@@ -1,0 +1,20 @@
+[Unit]
+Description=GenX320 event streamer (TCP, C++ build)
+After=genx320-setup.service network.target
+Requires=genx320-setup.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/repos/event-camera-viewer/genx320_streamer_native/build
+# Build first: see genx320_streamer_native/'s section of the README. Adjust
+# --port if you don't want the default 9000. Mutually exclusive with
+# genx320-record.service and genx320-streamer.service — all three need
+# exclusive access to the camera, so only enable one at a time.
+ExecStart=/home/pi/repos/event-camera-viewer/genx320_streamer_native/build/genx320_streamer
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

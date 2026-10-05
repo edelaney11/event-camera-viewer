@@ -27,6 +27,17 @@ onboard_streamer/tcp_event_streamer.cpp and network_reader.py byte-for-byte):
                                       EventCD numpy dtype, so batches from
                                       camera.get_iterator() are sent as-is
                                       via .tobytes(), no repacking needed.
+
+If this process itself becomes the bottleneck (profile it — under real
+load, decoding events into (x, y, p, t) is genuinely CPU-heavy, and
+Python's GIL serializes that against this script's own network-send loop
+on a single core even on a multi-core Pi), see genx320_streamer_native/ — a
+C++ equivalent speaking the exact same wire protocol, so network_reader.py
+and main.py --tcp need no changes to use it instead. (An earlier attempt at
+a --raw mode here, relaying undecoded bytes for the client to decode
+instead, turned out to be a dead end: OpenEB's RAW-file reading
+unconditionally seeks to end-of-file to measure total size, which a live
+pipe can never support — confirmed by testing, not just reasoning about it.)
 """
 from __future__ import annotations
 
@@ -74,15 +85,32 @@ _POP_POLL_S = 0.2
 
 class EventQueue:
     """Thread-safe hand-off between the camera pump thread (producer) and the
-    socket-writer loop (consumer). max_queued_events is an OOM circuit
-    breaker (dropping, loudly, under a sustained overload) for backlog that
-    accumulates *within* a connection (client briefly slower than the
-    camera) or between connections (before a client has (re)connected) — not
-    a guarantee that backlog ever reaches a client, since a fresh connection
-    discards it; see clear() and its call site in main()."""
+    socket-writer loop (consumer). Enforces one of two caps depending on
+    recording_event (shared with main()'s command handling):
 
-    def __init__(self, max_queued_events: int) -> None:
+      - Not recording (live view): live_cap, a deliberately small bound.
+        This tool feeds a live viewer, and if the camera produces events
+        faster than the link to the client can carry (e.g. a GenX320 in a
+        busy scene over Wi-Fi), buffering up to max_queued_events just
+        delays the problem — the viewer falls further and further behind
+        "live" until it does start dropping anyway, except now from a
+        multi-second-deep backlog instead of a shallow one. A small cap
+        means the drop starts immediately and lag stays bounded, which is
+        the right trade-off when nothing is being recorded.
+      - Recording: max_queued_events. Here dropping is a real, unwanted
+        loss, so by default (0) there is no cap at all — every event is
+        kept and eventually delivered no matter how large the backlog
+        grows, because recording means the caller needs all of it, not a
+        bounded approximation of it. A nonzero value turns this into an OOM
+        circuit breaker instead (dropping, loudly, rather than growing
+        memory without bound) — a deliberate trade of completeness for a
+        memory ceiling, not the default.
+    """
+
+    def __init__(self, max_queued_events: int, live_cap: int, recording_event: threading.Event) -> None:
         self._max = max_queued_events
+        self._live_cap = live_cap
+        self._recording_event = recording_event
         self._cv = threading.Condition()
         self._batches: deque[np.ndarray] = deque()
         self._queued = 0
@@ -100,7 +128,8 @@ class EventQueue:
         with self._cv:
             self._batches.append(batch)
             self._queued += batch.size
-            while self._max > 0 and self._queued > self._max and self._batches:
+            cap = self._max if self._recording_event.is_set() else self._live_cap
+            while cap > 0 and self._queued > cap and self._batches:
                 dropped = self._batches.popleft()
                 self._queued -= dropped.size
                 self._dropped += dropped.size
@@ -218,10 +247,36 @@ def parse_args() -> argparse.Namespace:
         help="Event batch slice duration in microseconds, passed to the SDK's EventsIterator (default: 10000).",
     )
     p.add_argument(
-        "--max-queued-events", type=int, default=20_000_000,
-        help="OOM safety valve, not a lag control (default: ~20M events, several hundred MB). "
-             "0 disables it (unbounded — risks an OOM crash instead of bounded, logged data loss "
-             "under pathological overload). See the docstring of EventQueue.",
+        "--max-queued-events", type=int, default=0,
+        help="Cap on backlog while recording (default: 0 = unlimited — every event is kept and "
+             "eventually delivered, no matter how far behind the network link falls, because "
+             "recording means you need all of it). This trades away the OOM protection a nonzero "
+             "value would give you: if the camera sustainably outpaces the link for long enough, "
+             "memory usage grows without bound and the process can eventually be killed for OOM, "
+             "which would lose the whole recording rather than just the overflow. Pass a nonzero "
+             "value (e.g. 20000000, several hundred MB) to accept that smaller, bounded, loud data "
+             "loss instead of the OOM risk — or fix the real imbalance with --max-rate, so the "
+             "backlog this is meant to protect against never has to grow large in the first place. "
+             "Not used while just live-viewing — see --live-queue-cap — and see EventQueue's docstring.",
+    )
+    p.add_argument(
+        "--live-queue-cap", type=int, default=500_000,
+        help="Cap on queued-but-unsent events while NOT recording (default: 500,000, a few MB). "
+             "Deliberately much smaller than --max-queued-events: if the camera produces events "
+             "faster than the link to the client can carry (e.g. a GenX320 in a busy scene over "
+             "Wi-Fi), this keeps the live view's lag bounded by dropping the oldest backlog "
+             "promptly, instead of growing a multi-second backlog before dropping anyway. If you "
+             "see repeated 'DATA LOSS' messages while just viewing, that's expected under sustained "
+             "overload — see --max-rate to address it at the source instead.",
+    )
+    p.add_argument(
+        "--max-rate", type=int, default=0, metavar="KEV_S",
+        help="Cap event production at the sensor itself, in kilo-events/sec (0 = unlimited, the "
+             "default), via the camera's on-chip Event Rate Controller (ERC) if it has one. WARNING: "
+             "events above this rate are never generated at all — permanent data loss at the source, "
+             "not lag. The right tool when the camera can sustainably produce more events than the "
+             "network link (e.g. Wi-Fi) can carry — caps the problem before it ever reaches the "
+             "queue, instead of coping with it downstream via --live-queue-cap.",
     )
     return p.parse_args()
 
@@ -247,6 +302,14 @@ def main() -> int:
             else:
                 print(f"[WARN] failed to set bias {name}={value}", file=sys.stderr)
 
+    if args.max_rate > 0:
+        if camera.set_erc(True, args.max_rate * 1000):
+            print(f"Max event rate limited to {args.max_rate} kEv/s (on-chip ERC)", flush=True)
+        else:
+            print(f"[WARN] --max-rate requested but this camera/plugin has no ERC facility "
+                  f"(camera.has_erc()={camera.has_erc()}) — ignoring, event rate is unlimited.",
+                  file=sys.stderr)
+
     try:
         listen_sock = _make_listen_socket(args.bind, args.port)
     except OSError as exc:
@@ -255,7 +318,6 @@ def main() -> int:
         return 1
     print(f"Listening on {args.bind}:{args.port}", flush=True)
 
-    queue = EventQueue(args.max_queued_events)
     stop_event = threading.Event()
     # None until the first client connects — see the "pump_thread is None"
     # branch below. Not started at process launch: pulling (and queuing)
@@ -264,8 +326,10 @@ def main() -> int:
     # first connecting client all at once and crashed it.
     pump_thread: threading.Thread | None = None
     # Process-level, not per-connection — see _read_commands()'s docstring
-    # for why it deliberately survives a disconnect/reconnect.
+    # for why it deliberately survives a disconnect/reconnect. Created
+    # before the queue, which reads it to pick which cap applies.
     recording_event = threading.Event()
+    queue = EventQueue(args.max_queued_events, args.live_queue_cap, recording_event)
 
     def _handle_stop(signum, frame) -> None:
         stop_event.set()
@@ -342,10 +406,19 @@ def main() -> int:
                     last_status = now
                     print(f"  (status: {queue.queued_events()} events queued)", flush=True)
                 dropped_now = queue.take_dropped()
-                if dropped_now:
+                if dropped_now and recording_event.is_set():
                     print(f"  (DATA LOSS: {dropped_now} events dropped — sustained overload exceeded "
                           f"--max-queued-events; raise it, or reduce sensor activity, if this recurs)",
                           file=sys.stderr)
+                elif dropped_now:
+                    # Expected, not an error: the camera is producing events
+                    # faster than this connection can carry them, and we're
+                    # not recording — see --live-queue-cap's and --max-rate's
+                    # help text for how to address it, rather than just the
+                    # symptom.
+                    print(f"  (falling behind: {dropped_now} oldest events dropped to stay live — "
+                          f"not recording, so this is expected under sustained overload; see "
+                          f"--max-rate to cap it at the source)", flush=True)
 
                 batch = queue.pop(_POP_POLL_S)
                 if batch is None:
@@ -377,9 +450,20 @@ def main() -> int:
                 # Forcing the dtype here keeps concatenate's output padded.
                 batch = parts[0] if len(parts) == 1 else np.concatenate(parts, dtype=EVENT_CD_DTYPE)
 
-                payload = struct.pack(_COUNT_FMT, batch.size) + batch.tobytes()
+                # Two sendall() calls, not one concatenated buffer: a numpy
+                # array satisfies the buffer protocol, so handing it to
+                # sendall() directly sends straight from its own memory —
+                # .tobytes() would copy it into a new bytes object first,
+                # and `header + batch.tobytes()` would copy it a *second*
+                # time to build the concatenated buffer. For a large
+                # coalesced message (up to 200,000 events, ~3.2MB) that's
+                # two needless full-size memcpys per send, purely to save
+                # one syscall — real CPU cost on a Pi, where this loop has
+                # been observed pegging a full core well before the network
+                # link (even gigabit Ethernet) was anywhere near its limit.
                 try:
-                    client_sock.sendall(payload)
+                    client_sock.sendall(struct.pack(_COUNT_FMT, batch.size))
+                    client_sock.sendall(batch)
                 except OSError:
                     client_ok = False
 

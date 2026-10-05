@@ -98,9 +98,10 @@ def parse_args() -> argparse.Namespace:
         "--tcp", metavar="HOST:PORT",
         help="Connect to a camera streamed over TCP (a Prophesee Onboard running "
              "tcp_event_streamer, or a GenX320/other camera running "
-             "genx320_streamer.py — same wire protocol, either works) instead of "
-             "a local camera or file, e.g. --tcp 169.254.10.10:9000. See "
-             "onboard_streamer/tcp_event_streamer.cpp and genx320_streamer.py.",
+             "genx320_streamer.py or genx320_streamer_native — same wire protocol, "
+             "any of them work) instead of a local camera or file, e.g. "
+             "--tcp 169.254.10.10:9000. See onboard_streamer/tcp_event_streamer.cpp, "
+             "genx320_streamer.py, and genx320_streamer_native/.",
     )
     # ── Common ──
     p.add_argument(

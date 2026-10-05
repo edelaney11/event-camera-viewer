@@ -21,3 +21,6 @@ g018_straight/
 
 # Onboard code
 onboard_references/
+
+# C++ build directories (onboard_streamer/, genx320_streamer_native/)
+build/

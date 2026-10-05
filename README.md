@@ -106,7 +106,29 @@ This gets you the full live viewer — bias/ROI panels, recording, tracking — 
 
 `genx320_streamer.py` doesn't start pulling events from the camera until a client actually connects (and discards anything already queued if a client reconnects later) — it's fine to leave it running on the Pi for a long time before you ever open the viewer; it won't hand you a backlog of everything that happened while nobody was watching.
 
+By default the connection is *live view, lossy*: if the camera produces events faster than the link to the viewer can carry (common over Wi-Fi with a busy scene), the oldest queued events are dropped to keep lag bounded rather than let a backlog grow. Press `H` in the viewer to start HDF5 recording — this tells the server to switch to lossless capture (preserving its backlog across any reconnect) for as long as you're actually recording, and it switches back to live/lossy once you stop. (RAW recording's `R` key doesn't do this — RAW recording needs direct hardware access, which `--tcp` mode doesn't have; use HDF5 recording over the network.)
+
+If you see repeated `DATA LOSS`/`falling behind` messages from `genx320_streamer.py`, that's either the camera outpacing the network link, or (check CPU usage on the Pi — `top`, or `py-spy top --pid <pid>` for a breakdown) `genx320_streamer.py` itself maxing out a core decoding events, in which case see "If genx320_streamer.py itself is the bottleneck" below before reaching for these. Otherwise, two ways to address a genuine link-bandwidth problem:
+- `--max-rate KEV_S` caps event production at the sensor itself (its on-chip Event Rate Controller), the right fix if it's a sustained, not just bursty, overload.
+- `--live-queue-cap N` (default 500,000) controls how much backlog builds up before dropping while not recording — lower it for tighter live lag, raise it to absorb bigger bursts. While actively recording, there's no cap at all by default (`--max-queued-events` defaults to 0 = unlimited) — every event is kept and delivered no matter how large the backlog grows, since recording means you need all of it. That trades away OOM protection: if the camera sustainably outpaces the link for long enough, memory usage grows without bound, and the process could eventually be killed for OOM — which would lose the whole recording, not just the overflow. Pass `--max-queued-events` a nonzero value to accept bounded, loud data loss instead of that risk, or use `--max-rate` so the imbalance this is meant to protect against doesn't happen in the first place.
+
 To run it as a systemd service the same way as `genx320-record` (see above), use [`systemd/genx320-streamer.service`](systemd/genx320-streamer.service) in place of `genx320-record.service` — same setup steps, same `genx320-setup` dependency, just swap which unit you enable.
+
+#### If genx320_streamer.py itself is the bottleneck
+
+On a Raspberry Pi, decoding events (parsing the sensor's native EVT format into `(x, y, p, t)`) is genuinely CPU-heavy, and Python's GIL serializes that decode work against `genx320_streamer.py`'s own network-send loop on a single core — so even a multi-core Pi can end up bottlenecked on one core, with the queue backing up and dropping even though the network link itself has headroom. If `py-spy` (`pip install py-spy`, then `sudo py-spy top --pid $(pgrep -f genx320_streamer.py)`) shows most of the time inside `metavision_core`'s own decode call rather than anything in `genx320_streamer.py`'s own code, that's this.
+
+[`genx320_streamer_native/`](genx320_streamer_native/) is a C++ equivalent — same wire protocol (`main.py --tcp` and `network_reader.py` need no changes to use it instead), same `--max-rate`/`--live-queue-cap`/`--max-queued-events` flags and recording-toggle behavior, built against OpenEB's own C++ SDK (`metavision_sdk_stream`, not the closed-source SDK `onboard_streamer/` uses). It pays the same native decode cost per event, but the camera's callback thread and the network-send thread are genuine OS threads with no GIL between them, so they can actually run concurrently on separate cores instead of serializing. Build it (needs the same OpenEB install already used for everything else — see `-DCMAKE_PREFIX_PATH` below if it's not found automatically):
+
+```bash
+cd genx320_streamer_native
+mkdir build && cd build
+cmake -DCMAKE_PREFIX_PATH=$OPENEB_INSTALL_DIR ..   # omit -D... if ~/openeb/install is already on the default search path
+make
+./genx320_streamer --port 9000
+```
+
+To run it as a systemd service, use [`systemd/genx320-streamer-native.service`](systemd/genx320-streamer-native.service) in place of `genx320-streamer.service` — same idea, just pointing at the compiled binary instead of the Python script.
 
 ## Quickstart
 
@@ -261,10 +283,11 @@ All subcommands accept `--label-a`/`--label-b` to name the runs being compared; 
 event-camera-viewer/
 ├── main.py              Live viewer / playback CLI entry point
 ├── record_headless.py   No-GUI RAW recording for headless/remote deployments
-├── genx320_streamer.py  No-GUI TCP event streaming for headless/remote deployments
-├── network_reader.py    TCP client for genx320_streamer.py / tcp_event_streamer.cpp (--tcp)
+├── genx320_streamer.py  No-GUI TCP event streaming for headless/remote deployments (Python)
+├── genx320_streamer_native/  Same, in C++ — for when genx320_streamer.py itself is the CPU bottleneck
+├── network_reader.py    TCP client for any of the above / tcp_event_streamer.cpp (--tcp)
 ├── onboard_streamer/    C++ TCP event streamer for a Prophesee Onboard
-├── systemd/             Unit files for record_headless.py/genx320_streamer.py on a headless Raspberry Pi
+├── systemd/             Unit files for record_headless.py/genx320_streamer(_native) on a headless Raspberry Pi
 ├── camera_manager.py    HAL device wrapper (biases, ROI, RAW recording)
 ├── visualizer.py        OpenCV display, controls, recording
 ├── hdf5_reader.py       Custom HDF5 event format reader
