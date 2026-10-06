@@ -122,6 +122,7 @@ class NetworkEventsIterator:
         self.width = width
         self.height = height
         self._closed = False
+        self._last_t: int | None = None  # see __iter__'s cross-batch monotonicity check
 
         print(f"Connected to {address}  |  {self.width}×{self.height}")
 
@@ -147,11 +148,29 @@ class NetworkEventsIterator:
             # EventsIterator produces locally — pass this straight through
             # without ever confirming a read-only buffer is actually safe there.
             batch = np.frombuffer(raw, dtype=EVENT_CD_DTYPE).copy()
+            # Originally fatal on either check below, on the assumption that
+            # non-monotonic data could only mean the TCP stream itself was
+            # desynced (see _MAX_EVENTS_PER_BATCH above, which still is fatal
+            # for that case — a garbage count is never legitimate). Real
+            # testing against a GenX320 showed a second, recoverable cause:
+            # the sensor's own EVT3 decoder occasionally logging "TimeHigh
+            # discrepancy" — a transient hardware/driver hiccup, server-side,
+            # that produces one bad-but-correctly-framed batch rather than
+            # corrupting the wire protocol. Crashing the whole viewer over
+            # one bad batch was too harsh, especially since this recurs —
+            # drop just this batch (never hand bad timestamps to the frame
+            # generator) and keep going, same as a dropped/coalesced batch
+            # anywhere else in this pipeline.
             if batch.size > 1 and (np.diff(batch["t"].astype(np.int64)) < 0).any():
-                raise RuntimeError(
-                    "received a non-monotonic event batch over the network — the TCP "
-                    "stream appears desynced"
-                )
+                print("[WARN] dropped a non-monotonic event batch from the network "
+                      "(likely a transient sensor/decoder hiccup, not a protocol error)")
+                continue
+            if batch.size > 0 and self._last_t is not None and int(batch["t"][0]) < self._last_t:
+                print("[WARN] dropped an event batch that went backward in time relative to the "
+                      "previous one (likely the same transient sensor/decoder hiccup)")
+                continue
+            if batch.size > 0:
+                self._last_t = int(batch["t"][-1])
             yield batch
 
     def set_recording(self, active: bool) -> None:

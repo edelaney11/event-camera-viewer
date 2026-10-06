@@ -7,6 +7,11 @@ Requires=genx320-setup.service
 Type=simple
 User=pi
 WorkingDirectory=/home/pi/repos/event-camera-viewer/genx320_streamer_native/build
+# Belt-and-braces: the binary itself also sets these (see genx320_streamer.cpp's
+# main()) since it has no Python-style bootstrap step to rely on — required
+# for the GenX320 V4L2 plugin to parse MIPI frame-end markers correctly.
+Environment=PSEE_VAR_V4L2_BSIZE=1
+Environment=V4L2_HEAP=vidbuf_cached
 # Build first: see genx320_streamer_native/'s section of the README. Adjust
 # --port if you don't want the default 9000. Mutually exclusive with
 # genx320-record.service and genx320-streamer.service — all three need

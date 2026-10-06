@@ -59,6 +59,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <iostream>
@@ -288,6 +289,22 @@ void read_commands(int client_fd, std::atomic<bool> &recording_active) {
 } // namespace
 
 int main(int argc, char *argv[]) {
+    // Required for the GenX320 (and IMX636) V4L2 plugin on Raspberry Pi:
+    // parse MIPI frame-end markers and use dma-heap allocation instead of
+    // mmap — see sdk_bootstrap.py's activate(), which sets these for every
+    // Python entry point in this repo (genx320_streamer.py included)
+    // before any metavision_* module is imported. This binary has no
+    // equivalent bootstrap, so it has to do it itself — and before any
+    // other code touches the HAL (DeviceDiscovery/Camera below are what
+    // actually dlopen() the plugin that reads these). Without this, the
+    // V4L2 plugin misparses frame boundaries, which desyncs the EVT3
+    // decoder's own internal timestamp tracking — the likely cause of a
+    // persistent (not occasional) "TimeHigh discrepancy" from the SDK.
+    // Harmless no-ops on non-V4L2 (e.g. USB) setups. 0 = don't overwrite
+    // a value the environment (or systemd unit's Environment=) already set.
+    ::setenv("PSEE_VAR_V4L2_BSIZE", "1", 0);
+    ::setenv("V4L2_HEAP", "vidbuf_cached", 0);
+
     std::string bind_addr;
     uint16_t port = 0;
     std::string serial;
