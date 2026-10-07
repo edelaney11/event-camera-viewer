@@ -16,7 +16,7 @@ onboard_streamer/tcp_event_streamer.cpp and network_reader.py byte-for-byte):
 
     Handshake, sent once as soon as a client connects:
         char[4]  magic     b"PECD"
-        uint32_t version   protocol version (currently 1)
+        uint32_t version   protocol version (currently 2)
         uint16_t width
         uint16_t height
 
@@ -27,6 +27,14 @@ onboard_streamer/tcp_event_streamer.cpp and network_reader.py byte-for-byte):
                                       EventCD numpy dtype, so batches from
                                       camera.get_iterator() are sent as-is
                                       via .tobytes(), no repacking needed.
+
+Protocol version 2 adds remote RAW recording, identically to
+tcp_event_streamer.cpp and genx320_streamer_native (all three are kept
+functionally identical — change them together): on request the camera
+records undecoded data to a file on this device (--record-dir) while the
+stream carries on as a preview, and the file is sent back over the same
+connection when recording stops. See tcp_event_streamer.cpp's header comment
+for the command and control-message formats.
 
 If this process itself becomes the bottleneck (profile it — under real
 load, decoding events into (x, y, p, t) is genuinely CPU-heavy, and
@@ -48,6 +56,7 @@ activate()
 
 import argparse
 import json
+import os
 import signal
 import socket
 import struct
@@ -62,7 +71,7 @@ from hdf5_reader import EVENT_CD_DTYPE
 
 _HEADER_FMT = "<4sIHH"
 _MAGIC = b"PECD"
-_PROTOCOL_VERSION = 1
+_PROTOCOL_VERSION = 2
 _COUNT_FMT = "<I"
 
 # Client → server commands — see network_reader.NetworkEventsIterator.set_recording(),
@@ -72,6 +81,22 @@ _COUNT_FMT = "<I"
 # whatever span the client is actually recording what it receives.
 _CMD_STOP_RECORDING = 0x00
 _CMD_START_RECORDING = 0x01
+# Remote RAW recording — see _RawRecorder.
+_CMD_START_RAW = 0x02  # followed by u8 name length, then the file name
+_CMD_STOP_RAW = 0x03   # stop it and send the file back
+
+# Server → client control message, sent in place of an event batch: this
+# marker where the count would be, then u8 type, u32 payload length, payload.
+_CONTROL_FMT = "<IBI"
+_CONTROL_MARKER = 0xFFFFFFFF
+_CTRL_RECORDING_STARTED = 1  # no payload
+_CTRL_RECORDING_ERROR = 2    # payload: human-readable message
+_CTRL_FILE_BEGIN = 3         # payload: u64 file size in bytes
+_CTRL_FILE_DATA = 4          # payload: next chunk of the RAW file
+_CTRL_FILE_END = 5           # no payload
+# One chunk of a finished RAW file is sent per event message, so the live
+# stream keeps flowing (and the queue keeps draining) during the transfer.
+_FILE_CHUNK_BYTES = 1 << 20
 
 # Cap on how much backlog gets coalesced into a single network message —
 # bounds worst-case message size without meaningfully limiting how much a
@@ -141,13 +166,14 @@ class EventQueue:
                 self._cv.wait(timeout)
             if not self._batches:
                 return None
-            return self._batches.popleft()
+            batch = self._batches.popleft()
+            self._queued -= batch.size
+            return batch
 
     def clear(self) -> int:
         """Discards any queued backlog and returns how many events were
-        dropped. Used when a new client connects — see the call site for why
-        this tool deliberately does NOT preserve backlog across connections
-        (unlike tcp_event_streamer.cpp, which is built for lossless capture)."""
+        dropped. Used when a new client connects while NOT recording — see
+        the call site."""
         with self._cv:
             dropped = self._queued
             self._batches.clear()
@@ -160,7 +186,9 @@ class EventQueue:
         with self._cv:
             if not self._batches:
                 return None
-            return self._batches.popleft()
+            batch = self._batches.popleft()
+            self._queued -= batch.size
+            return batch
 
     def queued_events(self) -> int:
         with self._cv:
@@ -194,9 +222,115 @@ def _pump_events(primed_iter, queue: EventQueue, stop_event: threading.Event) ->
         stop_event.set()
 
 
-def _read_commands(client_sock: socket.socket, recording_event: threading.Event) -> None:
-    """Runs on its own thread for the life of one connection, reading 1-byte
-    commands from the client (network_reader.NetworkEventsIterator.set_recording())
+def _send_control(client_sock: socket.socket, kind: int, payload: bytes = b"") -> bool:
+    try:
+        client_sock.sendall(struct.pack(_CONTROL_FMT, _CONTROL_MARKER, kind, len(payload)) + payload)
+        return True
+    except OSError:
+        return False
+
+
+class _RawRecorder:
+    """Remote RAW recording (protocol version 2): records undecoded sensor
+    data to a file in `directory` on this device using the camera's own RAW
+    recorder, while the decoded stream carries on as a live preview, then
+    sends the file back over the same connection once recording stops and
+    deletes it. A file the client hasn't fully received is never deleted.
+    Only ever used from the send loop's thread."""
+
+    def __init__(self, directory: str, camera: CameraManager) -> None:
+        self._dir = directory
+        self._camera = camera
+        self._rec_path: str | None = None   # set while the camera is recording to it
+        self._file_path: str | None = None  # the finished recording being sent back
+        self._file = None                   # open while that transfer is in progress
+
+    @property
+    def transferring(self) -> bool:
+        return self._file is not None
+
+    def service(self, client_sock: socket.socket, requests: deque) -> bool:
+        """Acts on any pending requests, then sends the next chunk of a
+        finished recording, if there is one. Returns False if the connection
+        failed."""
+        while requests:
+            start, name = requests.popleft()
+            if not (self._handle_start(client_sock, name) if start else self._handle_stop(client_sock)):
+                return False
+        return self._send_next_chunk(client_sock)
+
+    def client_disconnected(self) -> None:
+        if self._rec_path is not None:
+            self._camera.stop_raw_recording()
+            print(f"Client left mid-recording — RAW file kept on this device: {self._rec_path}", flush=True)
+            self._rec_path = None
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+            print(f"Transfer interrupted — RAW file kept on this device: {self._file_path}", flush=True)
+
+    def _handle_start(self, client_sock: socket.socket, name: str) -> bool:
+        error = ""
+        if self._rec_path is not None or self._file is not None:
+            error = "a recording is already in progress or still being transferred"
+        elif not name or name.startswith(".") or "/" in name:
+            error = "invalid recording name"
+        else:
+            path = os.path.join(self._dir, name)
+            if self._camera.start_raw_recording(path):
+                self._rec_path = path
+            else:
+                error = f"the camera could not start recording to {path}"
+        if error:
+            return _send_control(client_sock, _CTRL_RECORDING_ERROR, error.encode())
+        return _send_control(client_sock, _CTRL_RECORDING_STARTED)
+
+    def _handle_stop(self, client_sock: socket.socket) -> bool:
+        if self._rec_path is None:
+            return True
+        self._camera.stop_raw_recording()
+        self._file_path, self._rec_path = self._rec_path, None
+        try:
+            self._file = open(self._file_path, "rb")
+            size = os.fstat(self._file.fileno()).st_size
+        except OSError:
+            self._file = None
+            return _send_control(
+                client_sock, _CTRL_RECORDING_ERROR,
+                f"no RAW file was written at {self._file_path} (is --record-dir writable?)".encode(),
+            )
+        print(f"RAW recording stopped: sending {self._file_path} ({size} bytes)", flush=True)
+        return _send_control(client_sock, _CTRL_FILE_BEGIN, struct.pack("<Q", size))
+
+    def _send_next_chunk(self, client_sock: socket.socket) -> bool:
+        if self._file is None:
+            return True
+        try:
+            chunk = self._file.read(_FILE_CHUNK_BYTES)
+        except OSError:
+            self._file.close()
+            self._file = None
+            print(f"Reading {self._file_path} failed — file kept on this device.", file=sys.stderr)
+            return _send_control(
+                client_sock, _CTRL_RECORDING_ERROR,
+                f"reading the RAW file failed on the device; it was kept at {self._file_path}".encode(),
+            )
+        if chunk:
+            return _send_control(client_sock, _CTRL_FILE_DATA, chunk)
+        # self._file is left open on failure, so client_disconnected() reports the file as kept.
+        if not _send_control(client_sock, _CTRL_FILE_END):
+            return False
+        self._file.close()
+        self._file = None
+        os.unlink(self._file_path)
+        print("RAW recording sent and removed from this device.", flush=True)
+        return True
+
+
+def _read_commands(client_sock: socket.socket, recording_event: threading.Event, raw_requests: deque,
+                   client_gone: threading.Event) -> None:
+    """Runs on its own thread for the life of one connection, reading
+    commands from the client (network_reader.NetworkEventsIterator)
     concurrently with the main thread's send loop on the same socket — a TCP
     connection's two directions are independent, so this needs no
     coordination with the sender beyond the shared recording_event.
@@ -205,23 +339,40 @@ def _read_commands(client_sock: socket.socket, recording_event: threading.Event)
     reconnect, see main()) across any later disconnect/reconnect, until it
     explicitly tells us to stop — a dropped connection alone is not
     distinguished from a deliberate pause, since either way losing data
-    mid-recording is the wrong default. Returns when the client disconnects
-    or the socket errors; does not touch the event queue itself."""
+    mid-recording is the wrong default. RAW recording requests are only
+    parsed here, as (start, name) tuples on raw_requests; the send loop
+    carries them out. Returns when the client disconnects or the socket
+    errors; does not touch the event queue itself."""
+    buf = b""
     try:
         while True:
-            data = client_sock.recv(1)
+            data = client_sock.recv(256)
             if not data:
                 return
-            if data[0] == _CMD_START_RECORDING:
-                recording_event.set()
-                print("  Recording started by client — switching to lossless capture "
-                      "(backlog preserved across reconnects).", flush=True)
-            elif data[0] == _CMD_STOP_RECORDING:
-                recording_event.clear()
-                print("  Recording stopped by client — back to live view "
-                      "(backlog discarded on reconnect).", flush=True)
+            buf += data
+            while buf:
+                cmd = buf[0]
+                if cmd == _CMD_START_RAW:
+                    if len(buf) < 2 or len(buf) < 2 + buf[1]:
+                        break  # rest of the command hasn't arrived yet
+                    raw_requests.append((True, buf[2:2 + buf[1]].decode(errors="replace")))
+                    buf = buf[2 + buf[1]:]
+                    continue
+                if cmd == _CMD_START_RECORDING:
+                    recording_event.set()
+                    print("  Recording started by client — switching to lossless capture "
+                          "(backlog preserved across reconnects).", flush=True)
+                elif cmd == _CMD_STOP_RECORDING:
+                    recording_event.clear()
+                    print("  Recording stopped by client — back to live view "
+                          "(backlog discarded on reconnect).", flush=True)
+                elif cmd == _CMD_STOP_RAW:
+                    raw_requests.append((False, ""))
+                buf = buf[1:]
     except OSError:
         return
+    finally:
+        client_gone.set()
 
 
 def _make_listen_socket(bind_addr: str, port: int) -> socket.socket:
@@ -245,6 +396,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--slice-us", type=int, default=10000,
         help="Event batch slice duration in microseconds, passed to the SDK's EventsIterator (default: 10000).",
+    )
+    p.add_argument(
+        "--record-dir", default="/tmp", metavar="DIR",
+        help="Directory RAW recordings requested by the client are written to on this device, "
+             "before being sent back and deleted (default: /tmp). Needs room for a whole recording "
+             "and must keep up with the sensor's raw data rate.",
     )
     p.add_argument(
         "--max-queued-events", type=int, default=0,
@@ -330,6 +487,7 @@ def main() -> int:
     # before the queue, which reads it to pick which cap applies.
     recording_event = threading.Event()
     queue = EventQueue(args.max_queued_events, args.live_queue_cap, recording_event)
+    raw_recorder = _RawRecorder(args.record_dir, camera)
 
     def _handle_stop(signum, frame) -> None:
         stop_event.set()
@@ -395,12 +553,16 @@ def main() -> int:
                 client_sock.close()
                 continue
 
-            cmd_thread = threading.Thread(target=_read_commands, args=(client_sock, recording_event), daemon=True)
+            raw_requests: deque = deque()
+            client_gone = threading.Event()
+            cmd_thread = threading.Thread(
+                target=_read_commands, args=(client_sock, recording_event, raw_requests, client_gone), daemon=True
+            )
             cmd_thread.start()
 
             client_ok = True
             last_status = time.monotonic()
-            while client_ok and not stop_event.is_set():
+            while client_ok and not client_gone.is_set() and not stop_event.is_set():
                 now = time.monotonic()
                 if now - last_status >= _STATUS_INTERVAL_S:
                     last_status = now
@@ -420,7 +582,12 @@ def main() -> int:
                           f"not recording, so this is expected under sustained overload; see "
                           f"--max-rate to cap it at the source)", flush=True)
 
-                batch = queue.pop(_POP_POLL_S)
+                client_ok = raw_recorder.service(client_sock, raw_requests)
+                if not client_ok:
+                    break
+
+                # No waiting for events while a file transfer is in progress.
+                batch = queue.pop(0 if raw_recorder.transferring else _POP_POLL_S)
                 if batch is None:
                     continue
 
@@ -467,6 +634,7 @@ def main() -> int:
                 except OSError:
                     client_ok = False
 
+            raw_recorder.client_disconnected()
             print("Client disconnected.", flush=True)
             client_sock.close()
     except KeyboardInterrupt:

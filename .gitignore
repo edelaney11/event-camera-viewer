@@ -6,6 +6,7 @@ venv/
 
 # Event camera recordings and generated output
 *.raw
+*_info.json
 *.raw.tmp_index
 *.hdf5
 *.mp4

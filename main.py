@@ -70,6 +70,24 @@ class _FileCameraStub:
     def close(self):              pass
 
 
+class _RemoteRawCameraStub(_FileCameraStub):
+    """As _FileCameraStub, but RAW recording (R key) is carried out on the
+    streaming device itself and the file copied back afterwards — see
+    NetworkEventsIterator.start_remote_raw()."""
+
+    def __init__(self, it) -> None:
+        super().__init__(it.width, it.height)
+        self._it = it
+
+    def start_raw_recording(self, path: str) -> bool:
+        self.is_raw_recording = self._it.start_remote_raw(path)
+        return self.is_raw_recording
+
+    def stop_raw_recording(self) -> None:
+        self._it.stop_remote_raw()
+        self.is_raw_recording = False
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Prophesee event camera viewer with bias, ROI, and recording."
@@ -220,7 +238,10 @@ def main() -> int:
             print(f"Error: could not connect to {args.tcp} — {exc}", file=sys.stderr)
             return 1
 
-        camera: CameraManager = _FileCameraStub(it.width, it.height)  # type: ignore[assignment]
+        if it.supports_remote_raw:
+            camera: CameraManager = _RemoteRawCameraStub(it)  # type: ignore[assignment]
+        else:
+            camera = _FileCameraStub(it.width, it.height)  # type: ignore[assignment]
         viz = EventVisualizer(
             camera,
             delta_t_us=args.slice_us,
@@ -235,6 +256,11 @@ def main() -> int:
         except KeyboardInterrupt:
             pass
         finally:
+            try:
+                # A recording stopped by quitting still has to be copied over.
+                it.finish_remote_raw()
+            except KeyboardInterrupt:
+                pass
             it.close()
 
     else:

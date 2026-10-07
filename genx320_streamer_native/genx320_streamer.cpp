@@ -28,14 +28,10 @@
  * network_reader.py's _DecodedNetworkEventsIterator needs no changes   *
  * to talk to this tool instead of that one.                            *
  *                                                                      *
- * Beyond the wire protocol, this also ports two behaviors from the     *
- * current genx320_streamer.py (added after tcp_event_streamer.cpp was  *
- * originally written, see that script's own history/comments for the   *
- * incidents that motivated them) that tcp_event_streamer.cpp does NOT  *
- * have, because its lossless-capture-always use case never needed them:*
- *   - Lazy start: the camera isn't opened/started until the first      *
- *     client connects, instead of running (and queuing backlog) from   *
- *     process launch regardless of whether anyone is listening.        *
+ * Behavior shared with genx320_streamer.py and tcp_event_streamer.cpp  *
+ * (all three are kept functionally identical — change them together): *
+ *   - Lazy start: the camera isn't started until the first client      *
+ *     connects, instead of queuing backlog from process launch.        *
  *   - A live-view/recording distinction, toggled by a 1-byte command   *
  *     the client sends (see network_reader.py's set_recording()): live *
  *     view defaults to a small cap that drops old backlog to stay near *
@@ -43,12 +39,18 @@
  *     recording switches to a much larger (default: unlimited) cap and *
  *     preserves backlog across a reconnect instead, so a brief network *
  *     hiccup mid-recording doesn't lose data.                          *
+ *   - Remote RAW recording (protocol version 2): on request the camera *
+ *     records undecoded data to a file on this device (--record-dir)   *
+ *     while the stream carries on as a preview, and the file is sent   *
+ *     back over the same connection when recording stops.              *
  ************************************************************************/
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -62,11 +64,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <boost/program_options.hpp>
@@ -109,16 +113,33 @@ struct WireEvent {
 static_assert(sizeof(WireHeader) == 12, "WireHeader must be 12 bytes on the wire");
 static_assert(sizeof(WireEvent) == 16, "WireEvent must be 16 bytes on the wire");
 
-constexpr uint32_t kProtocolVersion = 1;
+constexpr uint32_t kProtocolVersion = 2;
 // Cap on how much backlog gets coalesced into a single network message (see
 // the send loop in main): bounds worst-case message size (~3.2MB) without
 // meaningfully limiting how much a burst can be coalesced.
 constexpr size_t kMaxEventsPerMessage = 200000;
 
 // Client -> server commands (the only bytes ever sent the other way on this
-// connection) — see network_reader.py's set_recording(), the only sender.
-constexpr char kCmdStopRecording = 0x00;
-constexpr char kCmdStartRecording = 0x01;
+// connection) — see network_reader.py, the only sender.
+constexpr char kCmdStopRecording = 0x00;  // back to live view (small queue cap)
+constexpr char kCmdStartRecording = 0x01; // client is recording the stream: lossless queue
+constexpr char kCmdStartRaw = 0x02;       // + uint8_t len, name: record RAW on this device
+constexpr char kCmdStopRaw = 0x03;        // stop that and send the file back
+
+// Server -> client control message, sent in place of an event batch: this
+// marker where the count would be, then uint8_t type, uint32_t payload
+// length, payload.
+constexpr uint32_t kControlMarker = 0xFFFFFFFF;
+enum class ControlType : uint8_t {
+    kRecordingStarted = 1, // no payload
+    kRecordingError = 2,   // payload: human-readable message
+    kFileBegin = 3,        // payload: uint64_t file size in bytes
+    kFileData = 4,         // payload: next chunk of the RAW file
+    kFileEnd = 5,          // no payload
+};
+// One chunk of a finished RAW file is sent per event message, so the live
+// stream keeps flowing (and the queue keeps draining) during the transfer.
+constexpr size_t kFileChunkBytes = 1 << 20;
 
 enum class PopResult { kGot, kTimeout, kStopped };
 
@@ -153,8 +174,7 @@ public:
 
     // Discards any queued backlog and returns how many events were dropped.
     // Used when a new client connects while NOT recording — see the call
-    // site in main() for why that's the opposite default from
-    // tcp_event_streamer.cpp, which is built for always-lossless capture.
+    // site in main().
     size_t clear() {
         std::lock_guard<std::mutex> lock(mutex_);
         size_t dropped = queued_events_;
@@ -219,6 +239,18 @@ bool send_all(int fd, const void *data, size_t len) {
     return true;
 }
 
+bool send_control(int fd, ControlType type, const void *payload = nullptr, uint32_t len = 0) {
+    char hdr[sizeof(kControlMarker) + sizeof(uint8_t) + sizeof(len)];
+    std::memcpy(hdr, &kControlMarker, sizeof(kControlMarker));
+    hdr[sizeof(kControlMarker)] = static_cast<char>(type);
+    std::memcpy(hdr + sizeof(kControlMarker) + 1, &len, sizeof(len));
+    return send_all(fd, hdr, sizeof(hdr)) && (len == 0 || send_all(fd, payload, len));
+}
+
+bool send_control(int fd, ControlType type, const std::string &text) {
+    return send_control(fd, type, text.data(), static_cast<uint32_t>(text.size()));
+}
+
 int make_listen_socket(const std::string &bind_addr, uint16_t port) {
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -259,29 +291,187 @@ int make_listen_socket(const std::string &bind_addr, uint16_t port) {
     return fd;
 }
 
-/// Runs on its own thread for the life of one connection, reading 1-byte
-/// commands from the client — see network_reader.py's set_recording(), the
-/// only sender, and EventQueue's docstring-equivalent comment above for
-/// what recording_active controls. recording_active is process-level, not
-/// per-connection: once the client says it's recording, backlog keeps
-/// getting preserved across any later disconnect/reconnect (see main())
-/// until it explicitly says to stop — a dropped connection alone is not
-/// distinguished from a deliberate pause, since losing data mid-recording
-/// is the wrong default either way.
-void read_commands(int client_fd, std::atomic<bool> &recording_active) {
-    char cmd;
+/// RAW recording requests, handed from the command-reading thread to the
+/// send loop — the only thread that touches the camera's recording API or
+/// writes to the socket.
+class RawRequests {
+public:
+    void post(bool start, const std::string &name = std::string()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        requests_.emplace_back(start, name);
+    }
+
+    bool take(bool &start, std::string &name) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (requests_.empty())
+            return false;
+        start = requests_.front().first;
+        name = requests_.front().second;
+        requests_.pop_front();
+        return true;
+    }
+
+private:
+    std::mutex mutex_;
+    std::deque<std::pair<bool, std::string>> requests_;
+};
+
+/// Remote RAW recording (protocol version 2): records undecoded sensor data
+/// to a file in `dir` on this device using the camera's own RAW recorder,
+/// while the decoded stream carries on as a live preview, then sends the
+/// file back over the same connection once recording stops and deletes it.
+/// A file the client hasn't fully received is never deleted.
+class RawRecorder {
+public:
+    using StartFn = std::function<std::string(const std::string &path)>; // returns an error message, empty if OK
+    using StopFn = std::function<void()>;
+
+    RawRecorder(const std::string &dir, StartFn start, StopFn stop) : dir_(dir), start_(start), stop_(stop) {}
+
+    bool transferring() const {
+        return file_fd_ >= 0;
+    }
+
+    /// Acts on any pending requests, then sends the next chunk of a finished
+    /// recording, if there is one. Returns false if the connection failed.
+    bool service(int client_fd, RawRequests &requests) {
+        bool start = false;
+        std::string name;
+        while (requests.take(start, name)) {
+            if (!(start ? handle_start(client_fd, name) : handle_stop(client_fd)))
+                return false;
+        }
+        return send_next_chunk(client_fd);
+    }
+
+    void client_disconnected() {
+        if (!rec_path_.empty()) {
+            stop_();
+            std::cerr << "Client left mid-recording — RAW file kept on this device: " << rec_path_ << std::endl;
+            rec_path_.clear();
+        }
+        if (file_fd_ >= 0) {
+            ::close(file_fd_);
+            file_fd_ = -1;
+            std::cerr << "Transfer interrupted — RAW file kept on this device: " << file_path_ << std::endl;
+        }
+    }
+
+private:
+    bool handle_start(int client_fd, const std::string &name) {
+        std::string error;
+        if (!rec_path_.empty() || file_fd_ >= 0) {
+            error = "a recording is already in progress or still being transferred";
+        } else if (name.empty() || name[0] == '.' || name.find('/') != std::string::npos) {
+            error = "invalid recording name";
+        } else {
+            const std::string path = dir_ + "/" + name;
+            error = start_(path);
+            if (error.empty()) {
+                rec_path_ = path;
+                std::cerr << "RAW recording started: " << rec_path_ << std::endl;
+            }
+        }
+        return error.empty() ? send_control(client_fd, ControlType::kRecordingStarted)
+                             : send_control(client_fd, ControlType::kRecordingError, error);
+    }
+
+    bool handle_stop(int client_fd) {
+        if (rec_path_.empty())
+            return true;
+        stop_();
+        file_path_ = rec_path_;
+        rec_path_.clear();
+        struct stat st {};
+        file_fd_ = ::open(file_path_.c_str(), O_RDONLY);
+        if (file_fd_ < 0 || ::fstat(file_fd_, &st) < 0) {
+            if (file_fd_ >= 0)
+                ::close(file_fd_);
+            file_fd_ = -1;
+            return send_control(client_fd, ControlType::kRecordingError,
+                                "no RAW file was written at " + file_path_ + " (is --record-dir writable?)");
+        }
+        const uint64_t size = static_cast<uint64_t>(st.st_size);
+        std::cerr << "RAW recording stopped: sending " << file_path_ << " (" << size << " bytes)" << std::endl;
+        return send_control(client_fd, ControlType::kFileBegin, &size, sizeof(size));
+    }
+
+    bool send_next_chunk(int client_fd) {
+        if (file_fd_ < 0)
+            return true;
+        chunk_.resize(kFileChunkBytes);
+        const ssize_t got = ::read(file_fd_, chunk_.data(), chunk_.size());
+        if (got > 0)
+            return send_control(client_fd, ControlType::kFileData, chunk_.data(), static_cast<uint32_t>(got));
+        if (got == 0) {
+            // file_fd_ is left open on failure, so client_disconnected() reports the file as kept.
+            if (!send_control(client_fd, ControlType::kFileEnd))
+                return false;
+            ::close(file_fd_);
+            file_fd_ = -1;
+            ::unlink(file_path_.c_str());
+            std::cerr << "RAW recording sent and removed from this device." << std::endl;
+            return true;
+        }
+        ::close(file_fd_);
+        file_fd_ = -1;
+        std::cerr << "Reading " << file_path_ << " failed — file kept on this device." << std::endl;
+        return send_control(client_fd, ControlType::kRecordingError,
+                            "reading the RAW file failed on the device; it was kept at " + file_path_);
+    }
+
+    const std::string dir_;
+    const StartFn start_;
+    const StopFn stop_;
+    std::string rec_path_;  // set while the camera is recording to it
+    std::string file_path_; // the finished recording being sent back
+    int file_fd_ = -1;      // open while that transfer is in progress
+    std::vector<char> chunk_;
+};
+
+/// Runs on its own thread for the life of one connection, reading commands
+/// from the client — see network_reader.py, the only sender. recording_active
+/// is process-level, not per-connection: once the client says it's
+/// recording, backlog keeps getting preserved across any later
+/// disconnect/reconnect (see main()) until it explicitly says to stop — a
+/// dropped connection alone is not distinguished from a deliberate pause,
+/// since losing data mid-recording is the wrong default either way. RAW
+/// recording requests are only parsed here; the send loop carries them out.
+void read_commands(int client_fd, std::atomic<bool> &recording_active, RawRequests &raw_requests,
+                   std::atomic<bool> &client_gone) {
+    std::string buf;
+    char tmp[256];
     while (true) {
-        ssize_t n = ::recv(client_fd, &cmd, 1, 0);
-        if (n <= 0)
+        ssize_t n = ::recv(client_fd, tmp, sizeof(tmp), 0);
+        if (n <= 0) {
+            client_gone = true;
             return;
-        if (cmd == kCmdStartRecording) {
-            recording_active = true;
-            std::cerr << "  Recording started by client — switching to lossless capture "
-                        "(backlog preserved across reconnects)." << std::endl;
-        } else if (cmd == kCmdStopRecording) {
-            recording_active = false;
-            std::cerr << "  Recording stopped by client — back to live view "
-                        "(backlog discarded on reconnect)." << std::endl;
+        }
+        buf.append(tmp, static_cast<size_t>(n));
+        while (!buf.empty()) {
+            const char cmd = buf[0];
+            if (cmd == kCmdStartRaw) {
+                if (buf.size() < 2)
+                    break; // rest of the command hasn't arrived yet
+                const size_t name_len = static_cast<uint8_t>(buf[1]);
+                if (buf.size() < 2 + name_len)
+                    break;
+                raw_requests.post(true, buf.substr(2, name_len));
+                buf.erase(0, 2 + name_len);
+                continue;
+            }
+            if (cmd == kCmdStartRecording) {
+                recording_active = true;
+                std::cerr << "  Recording started by client — switching to lossless capture "
+                             "(backlog preserved across reconnects)." << std::endl;
+            } else if (cmd == kCmdStopRecording) {
+                recording_active = false;
+                std::cerr << "  Recording stopped by client — back to live view "
+                             "(backlog discarded on reconnect)." << std::endl;
+            } else if (cmd == kCmdStopRaw) {
+                raw_requests.post(false);
+            }
+            buf.erase(0, 1);
         }
     }
 }
@@ -308,6 +498,7 @@ int main(int argc, char *argv[]) {
     std::string bind_addr;
     uint16_t port = 0;
     std::string serial;
+    std::string record_dir;
     uint32_t max_rate_kev_s = 0;
     uint32_t live_queue_cap = 0;
     uint32_t max_queued_events = 0;
@@ -326,6 +517,10 @@ int main(int argc, char *argv[]) {
         ("port,p", po::value<uint16_t>(&port)->default_value(9000), "TCP port to listen on")
         ("bind", po::value<std::string>(&bind_addr)->default_value("0.0.0.0"), "Address to bind the listening socket to")
         ("serial,s", po::value<std::string>(&serial)->default_value(""), "Camera serial number (blank = first available)")
+        ("record-dir", po::value<std::string>(&record_dir)->default_value("/tmp"),
+            "Directory RAW recordings requested by the client are written to on this "
+            "device, before being sent back and deleted. Needs room for a whole "
+            "recording and must keep up with the sensor's raw data rate.")
         ("max-rate", po::value<uint32_t>(&max_rate_kev_s)->default_value(0),
             "Cap event production at the sensor, in kilo-events/sec (0 = unlimited, "
             "the default), via the camera's on-chip Event Rate Controller (ERC) if "
@@ -379,6 +574,21 @@ int main(int argc, char *argv[]) {
     std::unique_ptr<Metavision::Camera> camera;
     bool camera_started = false;
     WireHeader header{};
+
+    RawRecorder raw_recorder(
+        record_dir,
+        [&camera](const std::string &path) -> std::string {
+            try {
+                if (!camera->start_recording(path))
+                    return "the camera could not start recording to " + path;
+            } catch (Metavision::CameraException &e) { return e.what(); }
+            return std::string();
+        },
+        [&camera]() {
+            try {
+                camera->stop_recording();
+            } catch (Metavision::CameraException &e) { std::cerr << "stop_recording failed: " << e.what() << std::endl; }
+        });
 
     while (!g_signal_caught && (!camera_started || camera->is_running())) {
         sockaddr_in client_addr{};
@@ -456,14 +666,17 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        std::thread cmd_thread(read_commands, client_fd, std::ref(recording_active));
+        RawRequests raw_requests;
+        std::atomic<bool> client_gone(false);
+        std::thread cmd_thread(read_commands, client_fd, std::ref(recording_active), std::ref(raw_requests),
+                               std::ref(client_gone));
 
         std::vector<Metavision::EventCD> batch, extra;
         std::vector<char> send_buf;
         bool client_ok = true;
         auto last_status_report = std::chrono::steady_clock::now();
 
-        while (client_ok && !g_signal_caught && camera->is_running()) {
+        while (client_ok && !client_gone && !g_signal_caught && camera->is_running()) {
             auto now = std::chrono::steady_clock::now();
             if (now - last_status_report >= std::chrono::seconds(10)) {
                 last_status_report = now;
@@ -484,7 +697,12 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            PopResult result = queue.pop(batch, std::chrono::milliseconds(200));
+            client_ok = raw_recorder.service(client_fd, raw_requests);
+            if (!client_ok)
+                break;
+
+            // No waiting for events while a file transfer is in progress.
+            PopResult result = queue.pop(batch, std::chrono::milliseconds(raw_recorder.transferring() ? 0 : 200));
             if (result == PopResult::kStopped)
                 break;
             if (result == PopResult::kTimeout)
@@ -517,6 +735,7 @@ int main(int argc, char *argv[]) {
             client_ok = send_all(client_fd, send_buf.data(), send_buf.size());
         }
 
+        raw_recorder.client_disconnected();
         std::cerr << "Client disconnected." << std::endl;
         ::shutdown(client_fd, SHUT_RDWR); // unblocks read_commands()'s recv()
         cmd_thread.join();

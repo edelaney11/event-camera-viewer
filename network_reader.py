@@ -11,7 +11,7 @@ for the authoritative definition:
 
     Handshake, sent once right after the TCP connection is accepted:
         4s   magic     b"PECD"
-        u32  version   protocol version (currently 1)
+        u32  version   protocol version (1, or 2 — see below)
         u16  width
         u16  height
 
@@ -20,6 +20,13 @@ for the authoritative definition:
         count * 16-byte events   see EVENT_CD_DTYPE (hdf5_reader.py) —
                                   x:u2, y:u2, p:i2, t:i8, with 2 bytes of
                                   padding between p and t
+
+Protocol version 2 adds remote RAW recording, identically on all three
+streamers: the device records undecoded sensor data to a file on its own storage while
+the decoded stream above carries on as a live preview, then sends that file
+back over this same connection once recording stops. See
+start_remote_raw()/stop_remote_raw() below, and that file's header comment
+for the command and control-message formats.
 
 (An earlier --raw mode here relayed undecoded bytes for this module to
 decode locally via OpenEB's RAW-file machinery, to move decode CPU cost off
@@ -32,8 +39,10 @@ thread and this protocol's network-send thread aren't serialized by a GIL.)
 """
 from __future__ import annotations
 
+import os
 import socket
 import struct
+import threading
 
 import numpy as np
 
@@ -42,7 +51,8 @@ from hdf5_reader import EVENT_CD_DTYPE
 _HEADER_FMT = "<4sIHH"
 _HEADER_SIZE = struct.calcsize(_HEADER_FMT)
 _MAGIC = b"PECD"
-_PROTOCOL_VERSION = 1
+_PROTOCOL_VERSIONS = (1, 2)
+_REMOTE_RAW_MIN_VERSION = 2
 _COUNT_FMT = "<I"
 _COUNT_SIZE = struct.calcsize(_COUNT_FMT)
 
@@ -60,14 +70,25 @@ _CONNECT_TIMEOUT_S = 10.0
 _MAX_EVENTS_PER_BATCH = 2_000_000
 
 # Client → server commands (the only bytes ever sent the other way on this
-# connection). Understood by genx320_streamer.py/genx320_streamer_native: a
-# server starts in a discard-backlog-on-reconnect "live view" mode, and
-# these switch it to/from a lossless mode that preserves backlog across a
-# reconnect instead, for the duration of an actual recording.
-# tcp_event_streamer.cpp doesn't read these (it's unconditionally lossless
-# once a client connects) — harmless, unread bytes left in its receive buffer.
+# connection). A server starts in a discard-backlog-on-reconnect "live view"
+# mode, and these switch it to/from a lossless mode that preserves backlog
+# across a reconnect instead, for the duration of an actual recording.
 _CMD_STOP_RECORDING = b"\x00"
 _CMD_START_RECORDING = b"\x01"
+# Remote RAW recording (protocol version 2).
+_CMD_START_RAW = b"\x02"  # followed by u8 name length, then the file name
+_CMD_STOP_RAW = b"\x03"
+
+# Server → client control message, sent in place of an event batch: this
+# marker where the count would be, then u8 type, u32 payload length, payload.
+_CONTROL_MARKER = 0xFFFFFFFF
+_CONTROL_FMT = "<BI"
+_CONTROL_SIZE = struct.calcsize(_CONTROL_FMT)
+_CTRL_RECORDING_STARTED = 1
+_CTRL_RECORDING_ERROR = 2
+_CTRL_FILE_BEGIN = 3
+_CTRL_FILE_DATA = 4
+_CTRL_FILE_END = 5
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
@@ -115,14 +136,24 @@ class NetworkEventsIterator:
         if magic != _MAGIC:
             self._sock.close()
             raise ConnectionError(f"{address} is not a recognized event streamer (bad magic {magic!r})")
-        if version != _PROTOCOL_VERSION:
+        if version not in _PROTOCOL_VERSIONS:
             self._sock.close()
-            raise ConnectionError(f"Unsupported protocol version {version} from {address} (expected {_PROTOCOL_VERSION})")
+            raise ConnectionError(f"Unsupported protocol version {version} from {address} (expected one of {_PROTOCOL_VERSIONS})")
 
         self.width = width
         self.height = height
         self._closed = False
         self._last_t: int | None = None  # see __iter__'s cross-batch monotonicity check
+
+        # Remote RAW recording (protocol version 2). start/stop are called
+        # from the UI thread, control messages arrive on the reader thread.
+        self.supports_remote_raw = version >= _REMOTE_RAW_MIN_VERSION
+        self._raw_lock = threading.Lock()
+        self._raw_path: str | None = None   # local destination of the current recording
+        self._raw_recording = False         # between start and stop requests
+        self._raw_pending = False           # stop sent, file not yet fully received
+        self._raw_file = None               # open "<path>.part" during the transfer
+        self._raw_received = 0
 
         print(f"Connected to {address}  |  {self.width}×{self.height}")
 
@@ -132,6 +163,12 @@ class NetworkEventsIterator:
                 (count,) = struct.unpack(_COUNT_FMT, _recv_exact(self._sock, _COUNT_SIZE))
             except ConnectionError:
                 return
+            if count == _CONTROL_MARKER:
+                try:
+                    self._read_control()
+                except ConnectionError:
+                    return
+                continue
             if count > _MAX_EVENTS_PER_BATCH:
                 raise RuntimeError(
                     f"implausible event count ({count}) received in one batch — the TCP "
@@ -187,8 +224,98 @@ class NetworkEventsIterator:
         except OSError:
             pass
 
+    # ── Remote RAW recording (protocol version 2) ─────────────────────────────
+
+    def start_remote_raw(self, local_path: str) -> bool:
+        """Asks the server to start recording RAW to its own storage. The
+        file is copied to local_path after stop_remote_raw()."""
+        if not self.supports_remote_raw:
+            return False
+        with self._raw_lock:
+            if self._raw_recording:
+                return False
+            if self._raw_pending:
+                print("[INFO] Previous RAW recording is still being copied from the device — try again shortly.")
+                return False
+            name = os.path.basename(local_path).encode()
+            try:
+                self._sock.sendall(_CMD_START_RAW + bytes([len(name)]) + name)
+            except (OSError, ValueError) as exc:
+                print(f"[WARN] could not start RAW recording on the device: {exc}")
+                return False
+            self._raw_path = local_path
+            self._raw_recording = True
+        print(f"RAW recording started on the device: {os.path.basename(local_path)}")
+        return True
+
+    def stop_remote_raw(self) -> None:
+        with self._raw_lock:
+            if not self._raw_recording:
+                return
+            self._raw_recording = False
+            try:
+                self._sock.sendall(_CMD_STOP_RAW)
+            except OSError as exc:
+                print(f"[WARN] could not stop RAW recording on the device: {exc}")
+                return
+            self._raw_pending = True
+        print("RAW recording stopped — copying it from the device …")
+
+    def finish_remote_raw(self) -> None:
+        """Blocks until a recording that has been stopped is fully received,
+        discarding event batches meanwhile. Only for use once nothing else is
+        iterating this object any more (i.e. at shutdown)."""
+        self.stop_remote_raw()
+        try:
+            while self._raw_pending and not self._closed:
+                (count,) = struct.unpack(_COUNT_FMT, _recv_exact(self._sock, _COUNT_SIZE))
+                if count == _CONTROL_MARKER:
+                    self._read_control()
+                elif count > _MAX_EVENTS_PER_BATCH:
+                    raise ConnectionError("stream desynced")
+                elif count:
+                    _recv_exact(self._sock, count * EVENT_CD_DTYPE.itemsize)
+        except (ConnectionError, OSError) as exc:
+            print(f"[WARN] connection lost while copying the RAW recording: {exc}")
+
+    def _read_control(self) -> None:
+        kind, length = struct.unpack(_CONTROL_FMT, _recv_exact(self._sock, _CONTROL_SIZE))
+        payload = _recv_exact(self._sock, length) if length else b""
+        with self._raw_lock:
+            if kind == _CTRL_RECORDING_ERROR:
+                print(f"[WARN] RAW recording on the device failed: {payload.decode(errors='replace')}")
+                self._abort_raw_locked()
+            elif kind == _CTRL_FILE_BEGIN and self._raw_path is not None:
+                (size,) = struct.unpack("<Q", payload)
+                self._raw_file = open(self._raw_path + ".part", "wb")
+                self._raw_received = 0
+                print(f"Receiving {os.path.basename(self._raw_path)} ({size / 1e6:.1f} MB) …")
+            elif kind == _CTRL_FILE_DATA and self._raw_file is not None:
+                self._raw_file.write(payload)
+                self._raw_received += len(payload)
+            elif kind == _CTRL_FILE_END and self._raw_file is not None:
+                self._raw_file.close()
+                self._raw_file = None
+                os.replace(self._raw_path + ".part", self._raw_path)
+                print(f"RAW recording saved: {self._raw_path} ({self._raw_received / 1e6:.1f} MB)")
+                self._raw_path = None
+                self._raw_pending = False
+
+    def _abort_raw_locked(self) -> None:
+        if self._raw_file is not None:
+            self._raw_file.close()
+            self._raw_file = None
+            print(f"[WARN] incomplete RAW recording left at {self._raw_path}.part")
+        self._raw_path = None
+        self._raw_recording = False
+        self._raw_pending = False
+
     def close(self) -> None:
         self._closed = True
+        with self._raw_lock:
+            if self._raw_recording or self._raw_pending:
+                print("[WARN] RAW recording was not fully copied — the original is still on the device.")
+            self._abort_raw_locked()
         try:
             self._sock.close()
         except OSError:
