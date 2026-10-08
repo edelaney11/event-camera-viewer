@@ -7,6 +7,9 @@ Live camera:
 Live camera over TCP (e.g. a Prophesee Onboard running tcp_event_streamer):
     python main.py --tcp 169.254.10.10:9000
 
+Several live cameras at once (repeat --serial / --tcp, optionally NAME=...):
+    python main.py --serial evk4= --tcp genx320=192.168.1.20:9000 --tcp onboard=169.254.10.10:9000
+
 File playback:
     python main.py --input recording_20240101_120000.hdf5 [--speed 1.0]
 
@@ -25,11 +28,12 @@ activate()
 
 import argparse
 import os
+import re
 import faulthandler
 faulthandler.enable()
 
 from camera_manager import CameraManager
-from visualizer import EventVisualizer
+from visualizer import EventVisualizer, MultiCameraViewer
 
 
 class _FileCameraStub:
@@ -109,17 +113,23 @@ def parse_args() -> argparse.Namespace:
     )
     # ── Live camera ──
     p.add_argument(
-        "--serial", default="",
-        help="Camera serial number (blank = first found). Ignored with --input.",
+        "--serial", action="append", nargs="?", const="", metavar="[NAME=][SN]",
+        help="Camera serial number — a bare --serial (or NAME=) means whichever "
+             "camera is plugged in, as does omitting it when no --tcp is given. "
+             "Ignored with --input. Repeat, and/or combine with --tcp, to open "
+             "several cameras at once — R / H then record on all of them together, "
+             "and NAME (default: the serial number) labels that camera's window "
+             "and recording files.",
     )
     p.add_argument(
-        "--tcp", metavar="HOST:PORT",
+        "--tcp", action="append", metavar="[NAME=]HOST:PORT",
         help="Connect to a camera streamed over TCP (a Prophesee Onboard running "
              "tcp_event_streamer, or a GenX320/other camera running "
              "genx320_streamer.py or genx320_streamer_native — same wire protocol, "
              "any of them work) instead of a local camera or file, e.g. "
              "--tcp 169.254.10.10:9000. See onboard_streamer/tcp_event_streamer.cpp, "
-             "genx320_streamer.py, and genx320_streamer_native/.",
+             "genx320_streamer.py, and genx320_streamer_native/. Repeatable, with "
+             "an optional NAME (default: the host) — see --serial.",
     )
     # ── Common ──
     p.add_argument(
@@ -152,8 +162,89 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _split_name(spec: str) -> tuple[str, str]:
+    """"NAME=VALUE" → (NAME, VALUE); a bare "VALUE" → ("", VALUE)."""
+    name, sep, value = spec.partition("=")
+    return (name, value) if sep else ("", spec)
+
+
+def _run_multi(args: argparse.Namespace, serials: list, tcp_addrs: list) -> int:
+    """Several live cameras in one instance — see MultiCameraViewer."""
+    if args.suite:
+        print("Error: --suite only supports a single camera.", file=sys.stderr)
+        return 1
+
+    sessions: list[tuple[str, object, object]] = []  # (label, camera, TCP iterator or None)
+
+    def add(name: str, fallback: str, camera, it=None) -> None:
+        label = re.sub(r"[^A-Za-z0-9_]+", "-", name or fallback).strip("-") or "cam"
+        if any(label == s[0] for s in sessions):
+            label = f"{label}-{len(sessions) + 1}"
+        sessions.append((label, camera, it))
+
+    def close_all() -> None:
+        for _, camera, it in sessions:
+            if it is None:
+                camera.close()
+                continue
+            try:
+                # A recording stopped by quitting still has to be copied over.
+                it.finish_remote_raw()
+            except KeyboardInterrupt:
+                pass
+            it.close()
+
+    try:
+        for name, serial in serials:
+            camera = CameraManager()
+            print(f"Opening camera {serial or '(first found)'} …")
+            camera.open(serial)
+            print(f"Camera ready: {camera.width}×{camera.height} px")
+            if not serial:
+                try:
+                    serial = camera.device.get_i_hw_identification().get_serial()
+                except Exception:
+                    pass
+            add(name, serial, camera)
+        if tcp_addrs:
+            from network_reader import NetworkEventsIterator
+        for name, addr in tcp_addrs:
+            it = NetworkEventsIterator(addr)
+            camera = _RemoteRawCameraStub(it) if it.supports_remote_raw else _FileCameraStub(it.width, it.height)
+            add(name, addr.rpartition(":")[0], camera, it)
+    except Exception as exc:
+        print(f"Error: could not open every camera — {exc}", file=sys.stderr)
+        close_all()
+        return 1
+
+    vizs = [
+        EventVisualizer(
+            camera,
+            delta_t_us=args.slice_us,
+            accumulation_us=args.accum_us,
+            display_fps=args.fps,
+            iterator=it,
+            tracker_algo=args.tracker_algo,
+            virtual_cam=args.virtual_cam and i == 0,  # one virtual webcam: the first camera
+            label=label,
+        )
+        for i, (label, camera, it) in enumerate(sessions)
+    ]
+    print("Cameras: " + ", ".join(f"[{i + 1}] {s[0]}" for i, s in enumerate(sessions))
+          + " — R / H record on all, Tab or 1-9 selects one for everything else.")
+    try:
+        MultiCameraViewer(vizs).run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        close_all()
+    return 0
+
+
 def main() -> int:
     args = parse_args()
+    serials = [_split_name(s) for s in args.serial or []]
+    tcp_addrs = [_split_name(a) for a in args.tcp or []]
 
     if args.playlist:
         # ── Playlist mode ─────────────────────────────────────────────────────
@@ -229,13 +320,17 @@ def main() -> int:
         finally:
             it.close()
 
-    elif args.tcp:
+    elif len(serials) + len(tcp_addrs) > 1:
+        return _run_multi(args, serials, tcp_addrs)
+
+    elif tcp_addrs:
         # ── Live camera over TCP (e.g. Prophesee Onboard) ───────────────────────
         from network_reader import NetworkEventsIterator
+        tcp_addr = tcp_addrs[0][1]
         try:
-            it = NetworkEventsIterator(args.tcp)
+            it = NetworkEventsIterator(tcp_addr)
         except Exception as exc:
-            print(f"Error: could not connect to {args.tcp} — {exc}", file=sys.stderr)
+            print(f"Error: could not connect to {tcp_addr} — {exc}", file=sys.stderr)
             return 1
 
         if it.supports_remote_raw:
@@ -268,7 +363,7 @@ def main() -> int:
         camera = CameraManager()
         try:
             print("Opening camera …")
-            camera.open(args.serial)
+            camera.open(serials[0][1] if serials else "")
             print(f"Camera ready: {camera.width}×{camera.height} px")
         except Exception as exc:
             print(f"Error: could not open camera — {exc}", file=sys.stderr)

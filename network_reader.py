@@ -42,6 +42,7 @@ from __future__ import annotations
 import os
 import socket
 import struct
+import sys
 import threading
 
 import numpy as np
@@ -140,6 +141,7 @@ class NetworkEventsIterator:
             self._sock.close()
             raise ConnectionError(f"Unsupported protocol version {version} from {address} (expected one of {_PROTOCOL_VERSIONS})")
 
+        self._address = address
         self.width = width
         self.height = height
         self._closed = False
@@ -161,12 +163,14 @@ class NetworkEventsIterator:
         while not self._closed:
             try:
                 (count,) = struct.unpack(_COUNT_FMT, _recv_exact(self._sock, _COUNT_SIZE))
-            except ConnectionError:
+            except ConnectionError as exc:
+                self._report_lost(exc)
                 return
             if count == _CONTROL_MARKER:
                 try:
                     self._read_control()
-                except ConnectionError:
+                except ConnectionError as exc:
+                    self._report_lost(exc)
                     return
                 continue
             if count > _MAX_EVENTS_PER_BATCH:
@@ -176,7 +180,8 @@ class NetworkEventsIterator:
                 )
             try:
                 raw = _recv_exact(self._sock, count * EVENT_CD_DTYPE.itemsize) if count else b""
-            except ConnectionError:
+            except ConnectionError as exc:
+                self._report_lost(exc)
                 return
             # .copy() rather than handing out the frombuffer() view directly:
             # that view is read-only (backed by an immutable bytes object),
@@ -209,6 +214,10 @@ class NetworkEventsIterator:
             if batch.size > 0:
                 self._last_t = int(batch["t"][-1])
             yield batch
+
+    def _report_lost(self, exc: Exception) -> None:
+        if not self._closed:
+            print(f"[WARN] connection to {self._address} lost: {exc}", file=sys.stderr)
 
     def set_recording(self, active: bool) -> None:
         """Tells the server to start/stop treating its backlog as something

@@ -602,6 +602,12 @@ int main(int argc, char *argv[]) {
         }
         int nodelay = 1;
         ::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+        // An accepted socket inherits the listening socket's SO_RCVTIMEO (set
+        // to poll accept()), which would make read_commands()'s recv() time
+        // out — and be taken for a disconnect — whenever the client goes
+        // 500 ms without sending a command, i.e. almost immediately.
+        timeval no_timeout{};
+        ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &no_timeout, sizeof(no_timeout));
 
         if (!camera_started) {
             try {

@@ -21,10 +21,15 @@ N            Skip to next suite step
 ]            Next file in playlist
 [            Previous file in playlist
 Q / Esc      Quit
+
+With several cameras open (see MultiCameraViewer), R and H start/stop
+recording on all of them together, Tab or 1-9 selects a camera, and every
+other key applies to the selected camera only.
 """
 from __future__ import annotations
 
 import itertools
+import json
 import os
 import shlex
 import shutil
@@ -210,6 +215,11 @@ def _describe_returncode(returncode: int) -> str:
 
 
 class EventVisualizer:
+    # One hidden Tk root (styles/theme live here) shared by every instance —
+    # ttkbootstrap does not support creating more than one ttk.Window() per
+    # process, and with several cameras there are several EventVisualizers.
+    _tk_master: Optional[ttk.Window] = None
+
     def __init__(
         self,
         camera: CameraManager,
@@ -223,6 +233,7 @@ class EventVisualizer:
         source_path: Optional[str] = None,
         tracker_algo: str = "MIL",
         virtual_cam: bool = False,
+        label: str = "",
     ) -> None:
         self._cam = camera
         self._delta_t_us = delta_t_us
@@ -233,6 +244,13 @@ class EventVisualizer:
         self._source_path = source_path  # path passed via --input, if any
         self._accum_us = accumulation_us
         self._display_fps = display_fps
+
+        # ── Multi-camera (see MultiCameraViewer) — a blank label means this
+        # is the only camera, and nothing below changes from single-camera use.
+        self._label = label
+        self._win = f"{MAIN_WIN} - {label}" if label else MAIN_WIN
+        self._active = True  # whether per-camera keys currently go to this one
+        self._evt_thread: Optional[threading.Thread] = None
 
         # ── Virtual webcam (optional) ────────────────────────────────────────
         self._virtual_cam_enabled = virtual_cam
@@ -279,10 +297,8 @@ class EventVisualizer:
         self._active_roi: Optional[tuple[int, int, int, int]] = None     # committed x0,y0,x1,y1
         self._center_roi_idx: int = -1  # index into _CENTER_ROI_FRACTIONS, or -1 if inactive
 
-        # ── Tk panels: one hidden master root (styles/theme live here) plus a
-        # Toplevel per visible panel — ttkbootstrap does not support creating
-        # more than one ttk.Window() per process.
-        self._tk_master: Optional[ttk.Window] = None
+        # ── Tk panels: a Toplevel per visible panel, attached to the shared
+        # _tk_master above.
         self._tk_root: Optional[ttk.Toplevel] = None
         self._tk_vars: dict[str, tk.IntVar] = {}
         self._tk_suppress_cb: bool = False  # prevent feedback when syncing scales
@@ -381,8 +397,27 @@ class EventVisualizer:
         for batch in pending:
             writer.write(batch)
 
-    def _start_hdf5(self) -> None:
-        path = f"recording_{datetime.now():%Y%m%d_%H%M%S}.hdf5"
+    def _stamped_path(self, prefix: str, ext: str, stamp: Optional[str] = None) -> str:
+        """<prefix>_<stamp>[_<label>].<ext> — MultiCameraViewer passes one
+        shared stamp so files recorded together sort together."""
+        stamp = stamp or f"{datetime.now():%Y%m%d_%H%M%S}"
+        suffix = f"_{self._label}" if self._label else ""
+        return f"{prefix}_{stamp}{suffix}.{ext}"
+
+    def _sync_point(self, when: str) -> dict:
+        """Host wall-clock time paired with the newest stream timestamp
+        displayed at that moment — see MultiCameraViewer._write_sync()."""
+        with self._frame_lock:
+            ts_us = self._latest_ts_us
+        return {f"{when}_host_unix_s": time.time(), f"{when}_stream_ts_us": ts_us}
+
+    @property
+    def hdf5_recording(self) -> bool:
+        with self._hdf5_lock:
+            return self._hdf5_writer is not None
+
+    def _start_hdf5(self, stamp: Optional[str] = None) -> str:
+        path = self._stamped_path("recording", "hdf5", stamp)
         writer = HDF5Writer(path, self._cam.width, self._cam.height)
         with self._hdf5_lock:
             self._hdf5_writer = writer
@@ -394,6 +429,7 @@ class EventVisualizer:
         if hasattr(self._iterator, "set_recording"):
             self._iterator.set_recording(True)
         print(f"HDF5 recording started: {path}")
+        return path
 
     def _stop_hdf5(self) -> None:
         with self._hdf5_lock:
@@ -409,6 +445,13 @@ class EventVisualizer:
             self._last_recording_kind = "HDF5"
 
     # ── RAW recording helpers (called from main thread) ───────────────────────
+
+    def _start_raw_recording(self, stamp: Optional[str] = None) -> Optional[str]:
+        path = self._stamped_path("recording", "raw", stamp)
+        if not self._cam.start_raw_recording(path):
+            return None
+        self._current_raw_path = path
+        return path
 
     def _stop_raw_recording(self) -> None:
         if not self._cam.is_raw_recording:
@@ -701,8 +744,11 @@ class EventVisualizer:
     def _ensure_tk_master(self) -> None:
         """Create the single hidden Tk root that all panel Toplevels attach to."""
         if self._tk_master is None:
-            self._tk_master = ttk.Window(themename=_TK_THEME)
+            EventVisualizer._tk_master = ttk.Window(themename=_TK_THEME)
             self._tk_master.withdraw()
+
+    def _panel_title(self, title: str) -> str:
+        return f"{title} - {self._label}" if self._label else title
 
     def _open_bias_panel(self) -> None:
         if self._file_mode:
@@ -716,7 +762,7 @@ class EventVisualizer:
             return
 
         self._ensure_tk_master()
-        root = ttk.Toplevel(title="Bias Controls", resizable=(True, False))
+        root = ttk.Toplevel(title=self._panel_title("Bias Controls"), resizable=(True, False))
         root.protocol("WM_DELETE_WINDOW", self._close_bias_panel)
 
         ttk.Label(root, text="0 = factory default", bootstyle="secondary",
@@ -762,7 +808,7 @@ class EventVisualizer:
             self._tk_master.update()
         except tk.TclError:
             # Master window was destroyed unexpectedly
-            self._tk_master = None
+            EventVisualizer._tk_master = None
             self._tk_root = None
             self._tk_vars.clear()
             self._filter_tk_root = None
@@ -784,7 +830,7 @@ class EventVisualizer:
             return
 
         self._ensure_tk_master()
-        root = ttk.Toplevel(title="Noise / Rate Filters", resizable=(True, False))
+        root = ttk.Toplevel(title=self._panel_title("Noise / Rate Filters"), resizable=(True, False))
         root.protocol("WM_DELETE_WINDOW", self._close_filter_panel)
         self._filter_tk_vars.clear()
 
@@ -983,6 +1029,8 @@ class EventVisualizer:
         rec_color = _HUD_REC if rec_pulse else tuple(c // 2 for c in _HUD_REC)
 
         badges: list[tuple[str, tuple]] = []
+        if self._label:
+            badges.append((self._label, _HUD_ACCENT if self._active else _HUD_TEXT_DIM))
         if raw_rec:
             badges.append(("RAW", rec_color))
         if hdf5_rec:
@@ -1029,7 +1077,7 @@ class EventVisualizer:
         elif self._file_mode:
             hint = ",/.:speed  +/-:accum  Spc:pause  S:snap  K:track  P:mark  X:split  Q:quit"
         else:
-            hint = "drag:ROI  O:centreROI  C:clrROI  R:RAW  H:HDF5  M:rename  X:split  B:biases  F:filters  K:track  T:suite  +/-:accum  Spc:pause  Q:quit"
+            hint = ("Tab:camera  " if self._label else "") + "drag:ROI  O:centreROI  C:clrROI  R:RAW  H:HDF5  M:rename  X:split  B:biases  F:filters  K:track  T:suite  +/-:accum  Spc:pause  Q:quit"
 
         hint_font = 0.38
         hint_lines = _wrap_tokens(hint.split("  "), W - 12, hint_font)
@@ -1154,7 +1202,9 @@ class EventVisualizer:
 
     # ── Main run loop (must be called from main thread) ───────────────────────
 
-    def run(self) -> None:
+    def start(self) -> bool:
+        """Open the window and start the background event thread. Returns
+        False if the source has nothing to show."""
         if self._iterator is None:
             self._iterator = self._cam.get_iterator(self._delta_t_us)
 
@@ -1164,88 +1214,101 @@ class EventVisualizer:
         try:
             first_evs = next(mv_gen)
         except StopIteration:
-            return
+            return False
         primed_gen = itertools.chain((first_evs,), mv_gen)
 
-        evt_thread = threading.Thread(target=self._event_loop, args=(primed_gen,), daemon=True)
-        evt_thread.start()
+        self._evt_thread = threading.Thread(target=self._event_loop, args=(primed_gen,), daemon=True)
+        self._evt_thread.start()
 
-        cv2.namedWindow(MAIN_WIN, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(MAIN_WIN, self._cam.width, self._cam.height)
-        cv2.setMouseCallback(MAIN_WIN, self._mouse_cb)
+        cv2.namedWindow(self._win, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self._win, self._cam.width, self._cam.height)
+        cv2.setMouseCallback(self._win, self._mouse_cb)
         self._init_seek_duration()
 
         if self._virtual_cam_enabled:
             self._open_virtual_cam()
 
-        blank = np.zeros((self._cam.height, self._cam.width, 3), dtype=np.uint8)
-        delay_ms = max(1, 1000 // self._display_fps)
+        self._blank = np.zeros((self._cam.height, self._cam.width, 3), dtype=np.uint8)
+        self._delay_ms = max(1, 1000 // self._display_fps)
+        return True
 
-        try:
-            while self._running:
-                if self._suite is not None:
-                    self._suite.tick()
-                    self._suite.flush_hdf5()
+    def step(self) -> bool:
+        """Render and show one display frame. Returns False once the window
+        has been closed."""
+        if self._suite is not None:
+            self._suite.tick()
+            self._suite.flush_hdf5()
 
-                self._flush_hdf5()
-                self._pump_tk()
+        self._flush_hdf5()
+        self._pump_tk()
 
-                with self._hdf5_lock:
-                    hdf5_rec = self._hdf5_writer is not None
+        hdf5_rec = self.hdf5_recording
 
-                if self._ts_surface is not None:
-                    with self._frame_lock:
-                        ts_us = self._latest_ts_us
-                        rate  = self._event_rate
-                    frame = self._render_time_surface(ts_us)
-                else:
-                    with self._frame_lock:
-                        frame = (self._latest_frame.copy()
-                                 if self._latest_frame is not None else blank.copy())
-                        ts_us = self._latest_ts_us
-                        rate  = self._event_rate
+        if self._ts_surface is not None:
+            with self._frame_lock:
+                ts_us = self._latest_ts_us
+                rate  = self._event_rate
+            frame = self._render_time_surface(ts_us)
+        else:
+            with self._frame_lock:
+                frame = (self._latest_frame.copy()
+                         if self._latest_frame is not None else self._blank.copy())
+                ts_us = self._latest_ts_us
+                rate  = self._event_rate
 
-                if self._tracker is not None and self._tracker.is_active:
-                    self._tracker.update(frame)
+        if self._tracker is not None and self._tracker.is_active:
+            self._tracker.update(frame)
 
-                if self._vcam is not None:
-                    # Send the clean render — before the HUD overlay is drawn in-place
-                    # below — so badges/timestamps/hints don't show up in a video call.
-                    try:
-                        self._vcam.send(frame)
-                    except Exception as exc:
-                        print(f"[WARN] virtual cam send failed, disabling: {exc}", file=sys.stderr)
-                        self._vcam.close()
-                        self._vcam = None
-
-                display = self._draw_overlay(frame, ts_us, rate, hdf5_rec)
-                cv2.imshow(MAIN_WIN, display)
-
-                if cv2.getWindowProperty(MAIN_WIN, cv2.WND_PROP_VISIBLE) < 1:
-                    break
-
-                key = cv2.waitKey(delay_ms) & 0xFF
-                self._handle_key(key)
-
-        finally:
-            self._running = False
-            self._stop_hdf5()
-            self._stop_raw_recording()
-            cv2.destroyAllWindows()
-            if self._vcam is not None:
+        if self._vcam is not None:
+            # Send the clean render — before the HUD overlay is drawn in-place
+            # below — so badges/timestamps/hints don't show up in a video call.
+            try:
+                self._vcam.send(frame)
+            except Exception as exc:
+                print(f"[WARN] virtual cam send failed, disabling: {exc}", file=sys.stderr)
                 self._vcam.close()
                 self._vcam = None
-            if self._tk_root is not None:
-                self._close_bias_panel()
-            if self._filter_tk_root is not None:
-                self._close_filter_panel()
-            if self._tk_master is not None:
-                try:
-                    self._tk_master.destroy()
-                except Exception:
-                    pass
-                self._tk_master = None
-            evt_thread.join(timeout=2.0)
+
+        display = self._draw_overlay(frame, ts_us, rate, hdf5_rec)
+        cv2.imshow(self._win, display)
+
+        return cv2.getWindowProperty(self._win, cv2.WND_PROP_VISIBLE) >= 1
+
+    def stop(self) -> None:
+        """Finalize recordings and tear down everything start() set up."""
+        self._running = False
+        self._stop_hdf5()
+        self._stop_raw_recording()
+        try:
+            cv2.destroyWindow(self._win)
+        except cv2.error:
+            pass  # already closed by the user
+        if self._vcam is not None:
+            self._vcam.close()
+            self._vcam = None
+        if self._tk_root is not None:
+            self._close_bias_panel()
+        if self._filter_tk_root is not None:
+            self._close_filter_panel()
+        if self._tk_master is not None:
+            try:
+                self._tk_master.destroy()
+            except Exception:
+                pass
+            EventVisualizer._tk_master = None
+        if self._evt_thread is not None:
+            self._evt_thread.join(timeout=2.0)
+
+    def run(self) -> None:
+        if not self.start():
+            return
+        try:
+            while self._running:
+                if not self.step():
+                    break
+                self._handle_key(cv2.waitKey(self._delay_ms) & 0xFF)
+        finally:
+            self.stop()
 
     def _render_time_surface(self, current_ts: int) -> np.ndarray:
         # Dark palette colours in BGR (matched from ColorPalette.Dark SDK values)
@@ -1310,9 +1373,7 @@ class EventVisualizer:
             elif self._cam.is_raw_recording:
                 self._stop_raw_recording()
             else:
-                path = f"recording_{datetime.now():%Y%m%d_%H%M%S}.raw"
-                if self._cam.start_raw_recording(path):
-                    self._current_raw_path = path
+                self._start_raw_recording()
 
         elif key in (ord("h"), ord("H")):
             if self._file_mode:
@@ -1417,7 +1478,7 @@ class EventVisualizer:
                 print("[INFO] Suite is not running.")
 
         elif key in (ord("s"), ord("S")):
-            path = f"snapshot_{datetime.now():%Y%m%d_%H%M%S}.png"
+            path = self._stamped_path("snapshot", "png")
             with self._frame_lock:
                 snap = self._latest_frame.copy() if self._latest_frame is not None else None
                 ts_us = self._latest_ts_us
@@ -1435,3 +1496,123 @@ class EventVisualizer:
         elif key == ord("["):
             if self._playlist is not None:
                 self._playlist.prev_file()
+
+
+class MultiCameraViewer:
+    """Drives several EventVisualizers — one window per camera — from a single
+    display loop, so that R / H start and stop recording on all of them
+    together. Tab or 1-9 selects a camera; every other key goes to that one.
+
+    The cameras' clocks are not synchronised with each other, so each group
+    recording also gets a sidecar JSON for lining the files up afterwards —
+    see _write_sync().
+    """
+
+    def __init__(self, visualizers: list[EventVisualizer]) -> None:
+        self._vizs = visualizers
+        self._active = 0
+        self._sync: dict[str, tuple[str, dict]] = {}  # kind → (sidecar path, contents)
+
+    def _select(self, index: int) -> None:
+        self._active = index
+        for i, viz in enumerate(self._vizs):
+            viz._active = (i == index)
+
+    def run(self) -> None:
+        pending, self._vizs = self._vizs, []
+        try:
+            for viz in pending:
+                if viz.start():
+                    self._vizs.append(viz)
+            if self._vizs:
+                self._select(0)
+                delay_ms = self._vizs[0]._delay_ms
+
+            quit_requested = False
+            while self._vizs and not quit_requested:
+                for viz in list(self._vizs):
+                    if not viz._running:
+                        # Its stream ended (e.g. a dropped TCP connection) —
+                        # don't take the other cameras' recordings down with it.
+                        print(f"[WARN] {viz._label}: stream ended — continuing without it.", file=sys.stderr)
+                        viz.stop()
+                        self._vizs.remove(viz)
+                    elif not viz.step():
+                        quit_requested = True
+                if not self._vizs:
+                    break
+                self._select(min(self._active, len(self._vizs) - 1))
+                if self._handle_key(cv2.waitKey(delay_ms) & 0xFF):
+                    quit_requested = True
+        finally:
+            for kind in list(self._sync):
+                self._stop_all(kind)
+            for viz in self._vizs:
+                viz.stop()
+
+    def _handle_key(self, key: int) -> bool:
+        """Returns True to quit."""
+        if key in (27, ord("q"), ord("Q")):
+            return True
+        if key == 9:  # Tab
+            self._select((self._active + 1) % len(self._vizs))
+        elif ord("1") <= key <= ord("9"):
+            if key - ord("1") < len(self._vizs):
+                self._select(key - ord("1"))
+        elif key in (ord("r"), ord("R")):
+            self._toggle_all("RAW")
+        elif key in (ord("h"), ord("H")):
+            self._toggle_all("HDF5")
+        else:
+            self._vizs[self._active]._handle_key(key)
+        return False
+
+    def _recording(self, kind: str) -> list[EventVisualizer]:
+        if kind == "RAW":
+            return [v for v in self._vizs if v._cam.is_raw_recording]
+        return [v for v in self._vizs if v.hdf5_recording]
+
+    def _toggle_all(self, kind: str) -> None:
+        if self._recording(kind):
+            self._stop_all(kind)
+            return
+
+        stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+        cameras: dict[str, dict] = {}
+        for viz in self._vizs:
+            path = viz._start_raw_recording(stamp) if kind == "RAW" else viz._start_hdf5(stamp)
+            if path is None:
+                print(f"[WARN] {viz._label}: {kind} recording did not start.", file=sys.stderr)
+                continue
+            cameras[viz._label] = {"file": path, **viz._sync_point("start")}
+        if cameras:
+            self._sync[kind] = (f"recording_{stamp}_{kind.lower()}_sync.json", {"cameras": cameras})
+            self._write_sync(kind)
+
+    def _stop_all(self, kind: str) -> None:
+        cameras = self._sync[kind][1]["cameras"] if kind in self._sync else {}
+        for viz in self._recording(kind):
+            if viz._label in cameras:
+                cameras[viz._label].update(viz._sync_point("stop"))
+            if kind == "RAW":
+                viz._stop_raw_recording()
+            else:
+                viz._stop_hdf5()
+        if kind in self._sync:
+            self._write_sync(kind)
+            del self._sync[kind]
+
+    def _write_sync(self, kind: str) -> None:
+        """Each camera timestamps events on its own clock, and the start/stop
+        commands reach them one after another (over TCP, a network round trip
+        later still), so files recorded together do not share a time origin.
+        This records, per camera, the host's wall-clock time when its
+        recording was started/stopped next to the stream timestamp on display
+        at that moment — enough to align the files to within the command and
+        display latency (milliseconds locally, more over a slow link)."""
+        path, doc = self._sync[kind]
+        try:
+            with open(path, "w") as f:
+                json.dump(doc, f, indent=2)
+        except OSError as exc:
+            print(f"[WARN] could not write {path}: {exc}", file=sys.stderr)

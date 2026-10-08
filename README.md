@@ -17,6 +17,24 @@ Developed and tested against a Prophesee EVK4HD (IMX636 sensor). `camera_manager
 - **MP4 export** and **suite comparison/plotting tools** for offline analysis
 - **Virtual webcam output** — send the live rendered view to a virtual camera so other apps (video calls, OBS, browsers) can use it as a normal webcam source
 
+## Multiple cameras
+
+Repeat `--serial` and/or `--tcp` to open several live cameras in one instance, each in its own window. An optional `NAME=` prefix labels the window and that camera's files:
+
+```bash
+python main.py --serial evk4= --tcp genx320=<pi-ip>:9000 --tcp onboard=169.254.10.10:9000
+```
+
+A bare `--serial` (or `NAME=` with nothing after it, as above) opens whichever camera is plugged in; give the serial number (`--serial evk4=<SN>`) only when more than one is.
+
+- `R` / `H` start and stop RAW / HDF5 recording on **all** cameras together, as `recording_<date>_<time>_<name>.raw|hdf5`.
+- `Tab` (or `1`-`9`) selects a camera; every other key (biases, filters, ROI, tracking, snapshot, rename, split) applies to the selected one, whose name badge is highlighted.
+- If one camera's stream ends (e.g. a dropped TCP connection), the others keep running and recording.
+
+The cameras are **not** clock-synchronised: each timestamps events on its own clock, and the start command reaches them one after another. Every group recording therefore also writes `recording_<date>_<time>_<raw|hdf5>_sync.json`, holding per camera the host wall-clock time at which its recording was started and stopped, next to the stream timestamp on display at that moment. That aligns the files to within the command/display latency — milliseconds for a local camera, a network round trip or more for `--tcp`. For tighter alignment, put a shared visual cue (e.g. a flashing LED) in view of all cameras.
+
+`--suite` is single-camera only, and `--virtual-cam` sends the first camera.
+
 ## Requirements
 
 - A Prophesee/Metavision-compatible event camera (for live capture — file playback works without one)
